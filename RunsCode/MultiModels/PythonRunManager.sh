@@ -14,18 +14,18 @@ for ((i=$1; i<=$2; i++))
 do
 	for RS in 1.
 	do
-        	for KS in 4  #125 250 500                                                                                                                                                         
+        	for KS in 1  #125 250 500                                                                                                                                                         
         	do
 	
 	 		
-			for BS in 500 250 125 #500 #6250 #500 #125 250 500                                                                                                                                                         
+			for BS in 128 #500 #6250 #500 #125 250 500                                                                                                                                                         
         		do
-        			for LR in 0.001 0.01 0.1 #0.1 0.01 0.001                                                                                              
+        			for LR in 0.001 #0.1 0.01 0.001                                                                                              
                 		do
-                                	for DS in 0. #4. #2. 4. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
+                                	for DS in 4. #4. #2. 4. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
                 					do
 
-						python3 IGB_Exp.py $i $FolderName  $LR $BS $KS $RS $DS
+						python3 ./RunsCode/MultiModels/IGB_Exp.py $i $FolderName  $LR $BS $KS $RS $DS
 					done	
 				done	
     	
