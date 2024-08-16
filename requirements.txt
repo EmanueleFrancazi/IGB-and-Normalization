@@ -8,5 +8,5 @@ scipy==1.14.0
 torch==2.3.0
 torchvision==0.18.0
 tqdm==4.66.5
-wandb==0.17.6
+wandb==0.17.7
 warmup_scheduler==0.3
