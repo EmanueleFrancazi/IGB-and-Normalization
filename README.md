@@ -1,6 +1,6 @@
 # Algorithms
 
-This repository contains code to reproduce experiments analyzing the effects of normalization layers on IGB (Invariant Gradient-Based). The code structure is designed to ensure compatibility with external repositories/projects with minimal edits, allowing for the extension of experiments and the study of IGB across different projects.
+This repository contains code to reproduce experiments analyzing the effects of normalization layers on IGB (Initial Guessing Bias). The code structure is designed to ensure compatibility with external repositories/projects with minimal edits, allowing for the extension of experiments and the study of IGB across different projects.
 
 **Note:** The codes in the `MultiModels` folder import modules from the `utils` folder. Runs must be launched from the project root directory (where `MultiModels/` and `utils/` are subdirectories) to use absolute imports.
 
@@ -39,7 +39,44 @@ pip install -r requirements.txt
 
 ## Running the Code
 
-To ensure proper functionality, all runs should be initiated from the project root directory. This setup guarantees that the absolute imports will work correctly, allowing the `MultiModels` scripts to access the necessary modules from the `utils` folder.
+Depending on the type of experiment you want to perform, there are two main approaches:
+
+### 1. Statistics at Initialization
+If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as $p_{f_0}^{\chi}(x)$), you can follow these steps:
+
+1. **Include the Model:**
+   - Insert your model directly into `./RunsCode/MultiModels/IGB_Exp.py` under the section `#%% Architecture`.
+   - Select your model during the instance creation under the section `#%% MODEL INSTANCE`.
+
+2. **Set TrainMode:**
+   - Open `./utils/IGB_utils.py` and set the variable `TrainMode = 'OFF'`. This ensures that the experiment stops after computing the statistics at initialization without entering the training phase.
+
+3. **Run Multiple Simulations:**
+   - To reconstruct the statistics of a variable (e.g., to reconstruct its distribution over an ensemble of initializations), you may need to run multiple simulations. Since these simulations only take measures at initialization, they are quick to execute.
+
+   - Example command to run 1000 instances of the experiment on different initializations:
+
+    ```bash
+    ./RunsCode/MultiModels/PythonRunManager.sh 1 1000 > code.out 2> code.err &
+    ```
+
+   This command will automatically perform 1000 instances of the same experiment on different initializations of the model.
+
+### 2. Study of the Learning Dynamics
+
+If you want to study the learning dynamics (i.e., the behavior of the model during training), you can follow the guidelines provided in the "Integration with External Projects" section. This involves:
+
+1. **Model Definition:**
+   - Define your model by inheriting from the `ImageClassificationBase` class and setting up the necessary layers and parameters.
+
+2. **Prepare for Training:**
+   - Initialize storage variables before starting the training process using `model.StoringVariablesCreation()`.
+
+3. **Training Step:**
+   - Use the `training_step` method from `IGB_utils.py` to handle the training process, which includes calculating the loss and performing backpropagation.
+
+4. **Validation Step:**
+   - At specified checkpoints during training, use the `evaluate` method to assess the model's performance on validation data. This ensures that you can monitor the learning dynamics over time.
 
 ## Integration with External Projects
 
