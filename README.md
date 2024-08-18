@@ -43,9 +43,7 @@ Depending on the type of experiment you want to perform, there are two main appr
 
 ### 1. Statistics at Initialization
 
-If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as <img src="https://latex.codecogs.com/png.latex?p_%7Bf_0%7D%5E%7B%5Cchi%7D%28x%29" style="vertical-align: -20%;" alt="equation" />
-
-), you can follow these steps:
+If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as <img src="https://latex.codecogs.com/png.latex?p_%7Bf_0%7D%5E%7B%5Cchi%7D%28x%29" style="vertical-align: middle; margin-bottom: -2px;" alt="equation" /> ), you can follow these steps:
 
 1. **Include the Model:**
    - Insert your model directly into `./RunsCode/MultiModels/IGB_Exp.py` under the section `#%% Architecture`.
