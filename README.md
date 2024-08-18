@@ -42,6 +42,7 @@ pip install -r requirements.txt
 Depending on the type of experiment you want to perform, there are two main approaches:
 
 ### 1. Statistics at Initialization
+
 If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as $p_{f_0}^{\chi}(x)$), you can follow these steps:
 
 1. **Include the Model:**
@@ -62,9 +63,53 @@ If you want to study the model's state at initialization (e.g., analyzing the di
 
    This command will automatically perform 1000 instances of the same experiment on different initializations of the model.
 
+### Bash Script
+
+As mentioned, the simulation is started through a bash script (`PythonRunManager.sh`). Within that script, some parameters are set. Specifically:
+
+* **RS**: ReLU Slope. The slope to assign to the customized ReLU (if present).
+* **KS**: Kernel size for the MaxPool layer (if present).
+* **LR**: The learning rate that will be used. It can be a single value or a set of values (which will be given one after the other).
+* **BS**: The batch size that will be used. It can be a single value or a set of values (which will be given one after another).
+* **DS**: Shifting constant used for data standardization.
+
+For each of the above parameters, it is also possible to select more than one value. In this case, `(i2 - i1 + 1)` runs will be performed sequentially for each combination of the chosen parameters. For each run, the simulation is started from the bash script using the command:
+
+```bash
+python3 ./RunsCode/MultiModels/IGB_Exp.py $i $FolderName $LR $BS $KS $RS $DS
+```
+
+The `IGB_Exp.py` script is thus called.
+
+### Reproducibility and Initialization: Random Seed
+
+Immediately after importing the modules in `IGB_Exp.py`, we proceed to initialize the random seeds. Note that initialization must be performed on all libraries that use pseudo-random number generators (in our case, numpy, random, torch).
+
+The operation of fixing the seed for a given simulation is a delicate process since a wrong choice could create an undesirable correlation between random variables generated in independent simulations.
+
+The following two lines fix the seed:
+
+```python
+t = int(time.time() * 1000.0)
+seed = ((t & 0xff0000) >> 24) + ((t & 0x00ff0000) >> 8) + ((t & 0x0000ff00) << 8) + ((t & 0x0000ff) << 24)
+```
+
+Python's `time()` method returns the time as a floating-point number expressed in seconds since the epoch, in UTC. This value is then amplified. Finally, the bit order is reversed to reduce dependence on the least significant bits, further increasing the distance between similar values (more details are provided directly in the code, as a comment, immediately after initialization).
+
+The resulting value is then used as a seed for initialization. The seed is saved within a file and printed out, so that the simulation can be easily reproduced if required.
+
+### Logging on Server
+
+To more easily monitor the runs and their results, the code automatically saves logs of relevant metrics on some servers, which can then be accessed at any time to check the status of the simulation.
+
+Specifically, simulation results will be available in:
+
+* **TensorBoard**: No logging is required for this server. For more information on using TensorBoard, see [How to use TensorBoard with PyTorch](https://pytorch.org/tutorials/recipes/recipes/tensorboard_with_pytorch.html).
+* **WandB**: You can access the server by creating a new account or through accounts from other portals (e.g., GitHub, Google). For more details, see [W&B - Getting Started with PyTorch](https://docs.wandb.ai/guides/integrations/pytorch) and [Intro to PyTorch with W&B](https://wandb.ai/site/articles/intro-to-pytorch-with-wandb).
+
 ### 2. Study of the Learning Dynamics
 
-If you want to study the learning dynamics (i.e., the behavior of the model during training), you can follow the guidelines provided in the "Integration with External Projects" section. This involves:
+If you want to study the learning dynamics (i.e., the behavior of the model during training), you can follow the guidelines provided in the [Integration with External Projects](#integration-with-external-projects) section. This involves:
 
 1. **Model Definition:**
    - Define your model by inheriting from the `ImageClassificationBase` class and setting up the necessary layers and parameters.
@@ -83,6 +128,7 @@ If you want to study the learning dynamics (i.e., the behavior of the model duri
 The tools included in this repository, particularly those in `utils/IGB_utils.py`, can be integrated into any external project/model to study IGB with minimal changes to the existing code. Below are the main steps to integrate this repository into a generic project:
 
 ### 1. Placement of Project Code
+
 Place your project code inside the `./RunsCode` directory. For example:
 
 ```
@@ -95,6 +141,7 @@ Place your project code inside the `./RunsCode` directory. For example:
 ```
 
 ### 2. Import `IGB_utils.py`
+
 To use the utilities from `IGB_utils.py`, adjust the `sys.path` to ensure the project root is accessible:
 
 ```python
@@ -110,6 +157,7 @@ from utils.IGB_utils import *
 ```
 
 ### 3. Model Definition
+
 When defining your DNN models, inherit from the `ImageClassificationBase` class to access attributes and methods useful for IGB simulations:
 
 ```python
@@ -120,6 +168,7 @@ class SimpleMLP(ImageClassificationBase):
 ```
 
 ### 4. Preparing for Training
+
 Before starting the training, initialize variables for storing metrics:
 
 ```python
@@ -128,20 +177,22 @@ model.StoringVariablesCreation()  # Initialize storage variables
 ```
 
 ### 5. Folder Structure for Results
+
 Create a directory to store the results of your runs:
 
 ```python
 FolderPath = './RunsResults/' + args.FolderName
 if not os.path.exists(FolderPath):
-    os.makedirs(FolderPath, exist_ok=True)
+    os.makedirs(FolderPath, exist.ok=True)
 
 # Create specific folder for the sample
 SampleFolderPath = f'{FolderPath}/LR{args.learning_rate}/KS{args.ks}/Slope{args.Relu_Slope}/Data_Shift{shift_const}/Sample{args.SampleIndex}'
 if not os.path.exists(SampleFolderPath):
-    os.makedirs(SampleFolderPath, exist_ok=True)
+    os.makedirs(SampleFolderPath, exist.ok=True)
 ```
 
 ### 6. Training Step
+
 Use the `training_step` method from `IGB_utils.py` to handle training:
 
 ```python
@@ -153,6 +204,7 @@ for batch in train_loader:
 ```
 
 ### 7. Validation Step
+
 Perform evaluation using the `evaluate` method during checkpoints:
 
 ```python
@@ -162,8 +214,4 @@ if (step + 1) in ValChecks:  # Validation phase
     WandB_logs(step + 1, model)  # Log on WandB
     save_on_file(model, params)  # Save metrics to file
 ```
-
----
-
-For further details on specific functionalities or to contribute, please refer to the respective scripts and documentation within each folder.
 

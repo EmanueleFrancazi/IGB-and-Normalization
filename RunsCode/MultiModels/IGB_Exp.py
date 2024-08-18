@@ -76,6 +76,105 @@ start_TotTime = time.time()
 
 
 
+#%% Setting Random seed
+
+def FixSeed(seed):
+    """
+    initialize the seed for random generator used over the run : we have to do it for all the libraries that use on random generator (yorch, random and numpy)
+
+    Parameters
+    ----------
+    seed : TYPE
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    torch.manual_seed(seed) #fixing the seed of 'torch' module
+    random.seed(seed) #fixing the seed of 'random' module
+    np.random.seed(seed) #fixing the seed of 'numpy' module   
+
+#HYPERPARAMETERS
+CheckMode = 'OFF' #this flag active ('ON') or deactive ('OFF') the checking mode (used for debugging purposes)
+#NOTE:Completely reproducible results are not guaranteed across PyTorch releases, individual commits, or different platforms. 
+#Furthermore, results may not be reproducible between CPU and GPU executions, even when using identical seeds.
+#However, there are some steps you can take to limit the number of sources of nondeterministic behavior for a specific platform, device, and PyTorch release.
+if CheckMode=='ON':#when we are in the checking mode we want to reproduce the same simulation to check the new modified code reproduce the same behaviour
+    seed = 0
+    FixSeed(seed)
+elif CheckMode=='OFF':
+    #creation of seeds for usual simulations
+    #WARNING: use the time of the machine as seed you have to be sure that also for short interval between successive interval you get different seeds
+    #with the following choice  for very short periods of time, the initial seeds for feeding the pseudo-random generator will be hugely different between two successive calls
+    t = int( time.time() * 1000.0 )
+    seed = ((t & 0xff000000) >> 24) + ((t & 0x00ff0000) >>  8) + ((t & 0x0000ff00) <<  8) + ((t & 0x000000ff) << 24)   
+    
+    #if the above syntax should be confusing:
+    """
+    Here is a hex value, 0x12345678, written as binary, and annotated with some bit positions:
+    
+    |31           24|23           16|15            8|7         bit 0|
+    +---------------+---------------+---------------+---------------+
+    |0 0 0 1 0 0 1 0|0 0 1 1 0 1 0 0|0 1 0 1 0 1 1 0|0 1 1 1 1 0 0 0|
+    +---------------+---------------+---------------+---------------+
+    
+    ...and here is 0x000000FF:
+    
+    +---------------+---------------+---------------+---------------+
+    |0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|1 1 1 1 1 1 1 1|
+    +---------------+---------------+---------------+---------------+
+    
+    So a bitwise AND selects just the bottom 8 bits of the original value:
+    
+    +---------------+---------------+---------------+---------------+
+    |0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|0 1 1 1 1 0 0 0|
+    +---------------+---------------+---------------+---------------+
+    
+    ...and shifting it left by 24 bits moves it from the bottom 8 bits to the top:
+    
+    +---------------+---------------+---------------+---------------+
+    |0 1 1 1 1 0 0 0|0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|0 0 0 0 0 0 0 0|
+    +---------------+---------------+---------------+---------------+
+    
+    ...which is 0x78000000 in hex.
+    
+    The other parts work on the remaining 8-bit portions of the input:
+    
+      0x12345678
+    & 0x000000FF
+      ----------
+      0x00000078 << 24 = 0x78000000       (as shown above)
+    
+      0x12345678
+    & 0x0000FF00
+      ----------
+      0x00005600 <<  8 = 0x00560000
+    
+      0x12345678
+    & 0x00FF0000
+      ----------
+      0x00340000 >>  8 = 0x00003400
+    
+      0x12345678
+    & 0x00000000
+      ----------
+      0x12000000 >> 24 = 0x00000012
+    
+                       | ----------
+                         0x78563412
+    
+    so the overall effect is to consider the 32-bit value ldata as a sequence of four 8-bit bytes, and reverse their order.
+        
+    """
+    
+    
+    
+    FixSeed(seed)
+    
+
+
 
 #%% USEFUL FUNCTIONS
 
