@@ -997,7 +997,7 @@ ds = 'CatsVsDogs' #options so far: 'Gaussian', 'CatsVsDogs', 'ImbalancedGaussian
 
 NormMode = 'BN' #4 possible modes: 'Shift'==add an offset to center the activated nodes, 'OFF'==No normalization, 'InitShift' == shift computed on the first batch and same statistics used for all the train steps 'BN' classic batch norm
 
-NormPos = 'After' # determine the position of norm. layer (w.r.t. the activation function). 2 possible modes: 'After' or 'Before'
+NormPos = 'Before' # determine the position of norm. layer (w.r.t. the activation function). 2 possible modes: 'After' or 'Before'
 
 OrderingClassesFlag='ON' #when set 'ON' order the weights raws of the last layer according to the IGB values such that classes with bigger guessing fraction have smaller node index
 
