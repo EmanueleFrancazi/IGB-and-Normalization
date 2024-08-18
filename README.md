@@ -27,7 +27,7 @@ This folder contains all the codes used to perform experiments. It includes subf
 
 ### `utils/`
 
-This folder contains functions necessary to integrate the experiments and investigations on IGB. The utilities provided here must be imported into the codes in the `RunsCode` folder.
+This folder contains essential functions and utilities required to integrate and perform experiments on IGB (Initial Guessing Bias). The key script within this folder is `IGB_utils.py`, which includes all the methods necessary for conducting experiments related to IGB. These utilities must be imported into the codes within the `RunsCode` folder to facilitate the experiments and analyses. For more details on how to properly integrate and use these utilities, refer to the [Study of the Learning Dynamics](#2-study-of-the-learning-dynamics) section.
 
 ### `requirements.txt`
 
@@ -43,7 +43,8 @@ Depending on the type of experiment you want to perform, there are two main appr
 
 ### 1. Statistics at Initialization
 
-If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as $p_{f_0}^{\chi}(x)$), you can follow these steps:
+If you want to study the model's state at initialization (e.g., analyzing the distribution of observables such as the fraction of datapoints assigned at initialization to the generic class 0, denoted as ![equation](https://latex.codecogs.com/png.latex?p_%7Bf_0%7D%5E%7B%5Cchi%7D%28x%29)
+), you can follow these steps:
 
 1. **Include the Model:**
    - Insert your model directly into `./RunsCode/MultiModels/IGB_Exp.py` under the section `#%% Architecture`.
@@ -181,17 +182,51 @@ model.StoringVariablesCreation()  # Initialize storage variables
 Create a directory to store the results of your runs:
 
 ```python
-FolderPath = './RunsResults/' + args.FolderName
-if not os.path.exists(FolderPath):
-    os.makedirs(FolderPath, exist.ok=True)
+# creating folder to store results
 
-# Create specific folder for the sample
-SampleFolderPath = f'{FolderPath}/LR{args.learning_rate}/KS{args.ks}/Slope{args.Relu_Slope}/Data_Shift{shift_const}/Sample{args.SampleIndex}'
+FolderPath = './RunsResults/SimulationResult'
+if not os.path.exists(FolderPath):
+    os.makedirs(FolderPath, exist_ok=True)  
+    
+# then we create the specific sample folder
+SampleFolderPath = FolderPath + '/Data_Shift' + str(shift_const) + '/Sample' + str(args.SampleIndex)
+print('The folder created for the sample has the path: ', SampleFolderPath)
 if not os.path.exists(SampleFolderPath):
-    os.makedirs(SampleFolderPath, exist.ok=True)
+    os.makedirs(SampleFolderPath, exist_ok=True) 
 ```
 
-### 6. Training Step
+**Note:** `SampleIndex` must be one of the arguments passed when launching the code so that a folder associated with the specific run can be created, and all its measurements can be stored within it.
+
+### 6. Define a Dictionary Wrapping All Useful Parameters
+
+After setting up the folder structure, you should define a dictionary to wrap all the useful parameters, including those imported from `IGB_utils.py`:
+
+```python
+# wrapping flags/variables from IGB_utils.py
+params = {
+    'NormMode': NormMode,
+    'hidden_sizes': hidden_sizes,
+    'n_outputs': n_outputs,
+    'input_size': input_size,
+    'NormPos': NormPos,
+    'Architecture': Architecture,
+    'ks': ks,
+    'ReLU_Slope': ReLU_Slope,
+    'Loss_function': Loss_function,
+    'IGB_Mode': IGB_Mode,
+    'train_classes': train_classes,
+    'valid_classes': valid_classes,
+    'num_data_points': {'Train': num_trdata_points, 'Eval': num_valdata_points},
+    'label_list': label_list,
+    'epochs': epochs,
+    'num_tr_batches': num_tr_batches,
+    'GradNormMode': GradNormMode,
+    'FolderPath': SampleFolderPath,
+}
+```
+
+
+### 7. Training Step
 
 Use the `training_step` method from `IGB_utils.py` to handle training:
 
@@ -203,9 +238,9 @@ for batch in train_loader:
     loss.backward()
 ```
 
-### 7. Validation Step
+### 8. Validation Step
 
-Perform evaluation using the `evaluate` method during checkpoints:
+Perform evaluation using the `evaluate` method at specific points during training:
 
 ```python
 if (step + 1) in ValChecks:  # Validation phase
@@ -213,5 +248,15 @@ if (step + 1) in ValChecks:  # Validation phase
     train_result = evaluate(model, train_loader, 'Train', params)
     WandB_logs(step + 1, model)  # Log on WandB
     save_on_file(model, params)  # Save metrics to file
+```
+
+**Note:** The block above is triggered at specific intervals defined by `ValChecks`. The selection of these intervals is flexible. However, `IGB_utils.py` provides a function to set intervals that are equispaced in logspace. To use this function:
+
+```python
+# define the intervals for evaluation
+N_ValidSteps = 30  # set the number of intervals for performing measurements during the run
+num_tr_batches = len(train_DataLoader)  # number of batches
+TimeValSteps = ValidTimes(num_epochs, num_tr_batches, N_ValidSteps)
+print('epochs with evaluation: ', TimeValSteps)
 ```
 
