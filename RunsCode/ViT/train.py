@@ -23,6 +23,17 @@ from utils.data_utils import get_loader
 from utils.dist_util import get_world_size
 
 
+
+import sys
+
+# Dynamically add the project root (two levels up) to sys.path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+sys.path.insert(0, project_root)
+
+from utils.IGB_utils import *
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -59,11 +70,19 @@ def setup(args):
     # Prepare model
     config = CONFIGS[args.model_type]
 
-    num_classes = 10 if args.dataset == "cifar10" else 100
+    if args.dataset == "cifar10":
+        num_classes = 10  
+    elif args.dataset == "CatsVsDogs":
+        num_classes = 2
+    else:
+        num_classes = 100
 
     model = VisionTransformer(config, args.img_size, zero_head=True, num_classes=num_classes)
     model.load_from(np.load(args.pretrained_dir))
     model.to(args.device)
+    
+    model.StoringVariablesCreation()  # Initialize storage variables 
+    
     num_params = count_parameters(model)
 
     logger.info("{}".format(config))
@@ -138,7 +157,7 @@ def valid(args, model, writer, test_loader, global_step):
     return accuracy
 
 
-def train(args, model):
+def train(args, model, params):
     """ Train the model """
     if args.local_rank in [-1, 0]:
         os.makedirs(args.output_dir, exist_ok=True)
@@ -147,7 +166,15 @@ def train(args, model):
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
     # Prepare dataset
-    train_loader, test_loader = get_loader(args)
+    train_loader  = get_loader(args)['train_loader']
+    test_loader =  get_loader(args)['test_loader']
+    num_trdata_points = get_loader(args)['num_trdata_points']
+    num_valdata_points = get_loader(args)['num_valdata_points']
+    
+    #compute the real number of steps as the number of batches in the train loader times the number of epochs
+    print('number of epochs for the simulation is', args.num_steps)
+    args.num_steps = args.num_steps*len(train_loader)
+    print('number of steps for the simulation is', args.num_steps)
 
     # Prepare optimizer and scheduler
     optimizer = torch.optim.SGD(model.parameters(),
@@ -192,8 +219,16 @@ def train(args, model):
                               disable=args.local_rank not in [-1, 0])
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
-            x, y = batch
-            loss = model(x, y)
+            
+            #x, y = batch
+            #loss = model(x, y)
+            
+            Res= model.training_step(batch, num_trdata_points, params)
+            loss = Res['loss']
+            #TrRes.append(Res['train_f'])
+            train_losses.append(loss)
+            
+            
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
@@ -220,13 +255,49 @@ def train(args, model):
                 if args.local_rank in [-1, 0]:
                     writer.add_scalar("train/loss", scalar_value=losses.val, global_step=global_step)
                     writer.add_scalar("train/lr", scalar_value=scheduler.get_lr()[0], global_step=global_step)
+                """
+                #substituted by the evaluation block from IGB_utils
+                
                 if global_step % args.eval_every == 0 and args.local_rank in [-1, 0]:
                     accuracy = valid(args, model, writer, test_loader, global_step)
                     if best_acc < accuracy:
                         save_model(args, model)
                         best_acc = accuracy
                     model.train()
-
+                """
+                
+                if (step+1) in params['TimeValSteps']:      # Validation phase
+                    
+                    #first we save the norm of the gradient used for the step and the corresponding step size
+                    total_norm = 0
+                    parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
+                    for p in parameters:
+                        param_norm = p.grad.detach().data.norm(2)
+                        total_norm += param_norm.item() ** 2
+                    total_norm = total_norm ** 0.5  
+                    
+                    model.GradNorm.append(total_norm)
+                    #we then multiply the gradnorm by the learning rate to get the step size
+                    model.StepSize.append(total_norm*optimizer.param_groups[-1]['lr']) #this works because in our caase all params group have the same learning rate
+                    
+                    #test eval
+                    test_result = evaluate(model, test_loader, 'Eval', params)
+                    test_result['train_loss'] = torch.stack(train_losses).mean().item()
+                    model.time.append(step+1)
+    
+                    
+                    #train eval
+                    train_result = evaluate(model, train_loader, 'Train', params)
+                    WandB_logs(step+1, model) #log on wandb 
+                    save_on_file(model, params)
+                    history.append(test_result) 
+    
+                
+                step+=1
+                optimizer.zero_grad() #reset gradient before next step
+                
+                
+                
                 if global_step % t_total == 0:
                     break
         losses.reset()
@@ -269,7 +340,7 @@ def main():
                         help="The initial learning rate for SGD.")
     parser.add_argument("--weight_decay", default=0, type=float,
                         help="Weight deay if we apply some.")
-    parser.add_argument("--num_steps", default=10000, type=int,
+    parser.add_argument("--num_steps", default=2000, type=int,
                         help="Total number of training epochs to perform.")
     parser.add_argument("--decay_type", choices=["cosine", "linear"], default="cosine",
                         help="How to decay the learning rate.")
@@ -293,7 +364,44 @@ def main():
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
+    
+    parser.add_argument('--SampleIndex', type=int, 
+                        help="specify the Sample index for the Run")    
+    
+    
     args = parser.parse_args()
+    
+    
+    
+    # creating folder to store results
+    
+    FolderPath = './RunsResults/SimulationResult'
+    if not os.path.exists(FolderPath):
+        os.makedirs(FolderPath, exist_ok=True)  
+        
+    #then we create the specific sample folder
+    FolderPath = FolderPath +'/Data_Shift' + str(shift_const) + '/Sample' + str(args.SampleIndex)
+    print('La cartella creata per il sample ha come path: ', FolderPath)
+    if not os.path.exists(FolderPath):
+        os.makedirs(FolderPath, exist_ok=True) 
+
+    # fix the steps for eval measures
+    N_ValidSteps=30
+    TimeValSteps= ValidTimes(args.num_steps, num_tr_batches, N_ValidSteps)
+    print('epochs with validation: ', TimeValSteps)
+        
+    # wrapping flags/variables from IGB_utils.py
+    params = {'NormMode': NormMode,  'hidden_sizes': hidden_sizes, 'n_outputs': n_outputs, 'input_size': input_size, 'NormPos': NormPos
+              , 'Architecture': Architecture
+              ,'ks':ks, 'ReLU_Slope': ReLU_Slope, 'Loss_function': Loss_function, 'IGB_Mode':IGB_Mode
+              , 'train_classes': train_classes, 'valid_classes':valid_classes, 'num_data_points': {'Train': num_trdata_points, 'Eval':num_valdata_points}, 'label_list':label_list
+              ,'epochs':epochs, 'num_tr_batches':num_tr_batches
+              , 'GradNormMode': GradNormMode,
+              
+              'TimeValSteps':TimeValSteps}
+
+
+    
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
@@ -321,7 +429,7 @@ def main():
     args, model = setup(args)
 
     # Training
-    train(args, model)
+    train(args, model, params)
 
 
 if __name__ == "__main__":

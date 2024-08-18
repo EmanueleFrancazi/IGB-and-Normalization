@@ -22,6 +22,19 @@ import models.configs as configs
 from .modeling_resnet import ResNetV2
 
 
+import sys
+import os
+
+# Dynamically add the project root (two levels up) to sys.path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+sys.path.insert(0, project_root)
+
+from utils.IGB_utils import *
+
+
+
+
 logger = logging.getLogger(__name__)
 
 
@@ -259,7 +272,7 @@ class Transformer(nn.Module):
         return encoded, attn_weights
 
 
-class VisionTransformer(nn.Module):
+class VisionTransformer(ImageClassificationBase):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
