@@ -22,10 +22,10 @@ do
         		do
         			for LR in 0.001 #0.1 0.01 0.001                                                                                              
                 		do
-                                	for DS in 4. #4. #2. 4. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
+                                	for DS in 6. #4. #2. 4. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
                 					do
 
-						python3 ./RunsCode/MultiModels/IGB_Exp.py $i $FolderName  $LR $BS $KS $RS $DS
+						python3 ./RunsCode/MultiModels/IGB_Exp.py --SampleIndex $i --FolderName $FolderName  --lr $LR --batch_size $BS --ks $KS --Relu_Slope $RS --Data_Shift_Constant $DS
 					done	
 				done	
     	

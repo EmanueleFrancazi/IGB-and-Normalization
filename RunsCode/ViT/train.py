@@ -14,24 +14,30 @@ import torch.distributed as dist
 
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
-from apex import amp
-from apex.parallel import DistributedDataParallel as DDP
-
-from models.modeling import VisionTransformer, CONFIGS
-from utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
-from utils.data_utils import get_loader
-from utils.dist_util import get_world_size
-
-
+#avoid apex
+#from apex import amp
+#from apex.parallel import DistributedDataParallel as DDP
 
 import sys
-
 # Dynamically add the project root (two levels up) to sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
 sys.path.insert(0, project_root)
 
+from RunsCode.ViT.utils.scheduler import WarmupLinearSchedule, WarmupCosineSchedule
+from RunsCode.ViT.utils.data_utils import get_loader
+from RunsCode.ViT.utils.dist_util import get_world_size
+
+from RunsCode.ViT.models.modeling import VisionTransformer, CONFIGS
+
+
+
+
+print(project_root)
+print(sys.path)
+
 from utils.IGB_utils import *
+
 
 
 logger = logging.getLogger(__name__)
@@ -165,15 +171,11 @@ def train(args, model, params):
 
     args.train_batch_size = args.train_batch_size // args.gradient_accumulation_steps
 
-    # Prepare dataset
-    train_loader  = get_loader(args)['train_loader']
-    test_loader =  get_loader(args)['test_loader']
-    num_trdata_points = get_loader(args)['num_trdata_points']
-    num_valdata_points = get_loader(args)['num_valdata_points']
+
     
     #compute the real number of steps as the number of batches in the train loader times the number of epochs
     print('number of epochs for the simulation is', args.num_steps)
-    args.num_steps = args.num_steps*len(train_loader)
+    args.num_steps = args.num_steps*len(params['train_loader'])
     print('number of steps for the simulation is', args.num_steps)
 
     # Prepare optimizer and scheduler
@@ -187,16 +189,31 @@ def train(args, model, params):
     else:
         scheduler = WarmupLinearSchedule(optimizer, warmup_steps=args.warmup_steps, t_total=t_total)
 
+    #avoid apex
+    """
     if args.fp16:
         model, optimizer = amp.initialize(models=model,
                                           optimizers=optimizer,
                                           opt_level=args.fp16_opt_level)
         amp._amp_state.loss_scalers[0]._loss_scale = 2**20
+    """
+    # With the following, which simply skips the amp initialization but keeps the optimizer and model unchanged:
+    if args.fp16:
+        model.half()  # Use PyTorch's native support for half-precision
+        
 
     # Distributed training
+    #avoid apex
+    """
     if args.local_rank != -1:
         model = DDP(model, message_size=250000000, gradient_predivide_factor=get_world_size())
-
+    """
+    if args.local_rank != -1:
+        from torch.nn.parallel import DistributedDataParallel as DDP
+        model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
+    
+    
+    
     # Train!
     logger.info("***** Running training *****")
     logger.info("  Total optimization steps = %d", args.num_steps)
@@ -212,19 +229,24 @@ def train(args, model, params):
     global_step, best_acc = 0, 0
     while True:
         model.train()
-        epoch_iterator = tqdm(train_loader,
+        epoch_iterator = tqdm(params['train_loader'],
                               desc="Training (X / X Steps) (loss=X.X)",
                               bar_format="{l_bar}{r_bar}",
                               dynamic_ncols=True,
                               disable=args.local_rank not in [-1, 0])
+        train_losses = []
         for step, batch in enumerate(epoch_iterator):
             batch = tuple(t.to(args.device) for t in batch)
+            #print('BATCH', batch)
             
-            #x, y = batch
+            x, y = batch
+            #print(f"Batch shape: {x.shape}")
             #loss = model(x, y)
             
-            Res= model.training_step(batch, num_trdata_points, params)
+            Res= model.training_step(batch, params['num_trdata_points'], params)
             loss = Res['loss']
+            #print('mean loss :', loss)
+            #print(loss)
             #TrRes.append(Res['train_f'])
             train_losses.append(loss)
             
@@ -232,18 +254,33 @@ def train(args, model, params):
 
             if args.gradient_accumulation_steps > 1:
                 loss = loss / args.gradient_accumulation_steps
+                
+            #avoid apex
+            """
             if args.fp16:
                 with amp.scale_loss(loss, optimizer) as scaled_loss:
                     scaled_loss.backward()
             else:
                 loss.backward()
+            """
+            
+            if args.fp16:
+                loss.backward()
+            else:
+                loss.backward()
 
+            
             if (step + 1) % args.gradient_accumulation_steps == 0:
                 losses.update(loss.item()*args.gradient_accumulation_steps)
+                #avoid apex
+                """
                 if args.fp16:
                     torch.nn.utils.clip_grad_norm_(amp.master_params(optimizer), args.max_grad_norm)
                 else:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                """
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    
                 scheduler.step()
                 optimizer.step()
                 optimizer.zero_grad()
@@ -265,8 +302,9 @@ def train(args, model, params):
                         best_acc = accuracy
                     model.train()
                 """
-                
-                if (step+1) in params['TimeValSteps']:      # Validation phase
+                if global_step % t_total == 0:
+                    break       
+                if (global_step) in params['TimeValSteps']:      # Validation phase
                     
                     #first we save the norm of the gradient used for the step and the corresponding step size
                     total_norm = 0
@@ -281,25 +319,25 @@ def train(args, model, params):
                     model.StepSize.append(total_norm*optimizer.param_groups[-1]['lr']) #this works because in our caase all params group have the same learning rate
                     
                     #test eval
-                    test_result = evaluate(model, test_loader, 'Eval', params)
+                    test_result = evaluate(model, params['test_loader'], 'Eval', params)
                     test_result['train_loss'] = torch.stack(train_losses).mean().item()
-                    model.time.append(step+1)
+                    model.time.append(global_step+1)
     
                     
                     #train eval
-                    train_result = evaluate(model, train_loader, 'Train', params)
-                    WandB_logs(step+1, model) #log on wandb 
+                    train_result = evaluate(model, params['train_loader'], 'Train', params)
+                    WandB_logs(global_step+1, model) #log on wandb 
                     save_on_file(model, params)
-                    history.append(test_result) 
-    
-                
-                step+=1
-                optimizer.zero_grad() #reset gradient before next step
                 
                 
+
+            
+            #step+=1
+            #optimizer.zero_grad() #reset gradient before next step
                 
-                if global_step % t_total == 0:
-                    break
+                
+                
+
         losses.reset()
         if global_step % t_total == 0:
             break
@@ -315,7 +353,7 @@ def main():
     # Required parameters
     parser.add_argument("--name", required=True,
                         help="Name of this run. Used for monitoring.")
-    parser.add_argument("--dataset", choices=["cifar10", "cifar100"], default="cifar10",
+    parser.add_argument("--dataset", choices=["cifar10", "cifar100", 'CatsVsDogs'], default="cifar10",
                         help="Which downstream task.")
     parser.add_argument("--model_type", choices=["ViT-B_16", "ViT-B_32", "ViT-L_16",
                                                  "ViT-L_32", "ViT-H_14", "R50-ViT-B_16"],
@@ -357,21 +395,34 @@ def main():
                         help="Number of updates steps to accumulate before performing a backward/update pass.")
     parser.add_argument('--fp16', action='store_true',
                         help="Whether to use 16-bit float precision instead of 32-bit")
+    #avoid apex
+    """
     parser.add_argument('--fp16_opt_level', type=str, default='O2',
                         help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3']."
                              "See details at https://nvidia.github.io/apex/amp.html")
+    """
+    parser.add_argument('--fp16_opt_level', type=str, default='O2',
+                    help="For fp16: Apex AMP optimization level selected in ['O0', 'O1', 'O2', and 'O3'].")
+
     parser.add_argument('--loss_scale', type=float, default=0,
                         help="Loss scaling to improve fp16 numeric stability. Only used when fp16 set to True.\n"
                              "0 (default value): dynamic loss scaling.\n"
                              "Positive power of 2: static loss scaling value.\n")
     
-    parser.add_argument('--SampleIndex', type=int, 
-                        help="specify the Sample index for the Run")    
     
     
-    args = parser.parse_args()
+    #args = parser.parse_args()
+    
+    # Parse known arguments
+    args, unknown = parser.parse_known_args()
     
     
+    # Merge args0 (from IGB_utils) and args
+    for key, value in vars(args0).items():
+        setattr(args, key, value)
+
+    # Now args contains all arguments from both IGB_utils.py and train.py
+    print(args)
     
     # creating folder to store results
     
@@ -384,9 +435,31 @@ def main():
     print('La cartella creata per il sample ha come path: ', FolderPath)
     if not os.path.exists(FolderPath):
         os.makedirs(FolderPath, exist_ok=True) 
+        
+    # Prepare dataset
+    dataset = get_loader(args)
+    train_loader  = dataset['train_loader']
+    test_loader =  dataset['test_loader']
+    num_trdata_points = dataset['num_trdata_points']
+    num_valdata_points = dataset['num_valdata_points']
+    input_size = dataset['input_size']
+    
+    train_classes = per_class_counting(dataset['train_ds'])
+    valid_classes = per_class_counting(dataset['test_ds'])
+    
+    if Loss_function=='Hinge':
+        label_list=[-1, 1] #for the hinge we have to map the labels
+    else:
+        label_list = list(train_classes.keys())
+    print('the classes for train and valid are: ', train_classes, valid_classes, label_list)    
+    
+    num_classes = len(train_classes)
+
+
 
     # fix the steps for eval measures
     N_ValidSteps=30
+    num_tr_batches = len(train_loader)
     TimeValSteps= ValidTimes(args.num_steps, num_tr_batches, N_ValidSteps)
     print('epochs with validation: ', TimeValSteps)
         
@@ -397,23 +470,26 @@ def main():
               , 'train_classes': train_classes, 'valid_classes':valid_classes, 'num_data_points': {'Train': num_trdata_points, 'Eval':num_valdata_points}, 'label_list':label_list
               ,'epochs':epochs, 'num_tr_batches':num_tr_batches
               , 'GradNormMode': GradNormMode,
-              
-              'TimeValSteps':TimeValSteps}
+              'FolderPath': FolderPath,
+              'TimeValSteps':TimeValSteps,
+              'train_loader': train_loader, 'test_loader': test_loader, 'num_trdata_points': num_trdata_points, 'num_valdata_points':num_valdata_points,
+              'SampleIndex': args.SampleIndex}
 
 
     
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         args.n_gpu = torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda", args.local_rank)
+        device = torch.device("cuda:1", args.local_rank)
         torch.distributed.init_process_group(backend='nccl',
                                              timeout=timedelta(minutes=60))
         args.n_gpu = 1
     args.device = device
+    params['device'] = device
 
     # Setup logging
     logging.basicConfig(format='%(asctime)s - %(levelname)s - %(name)s - %(message)s',
@@ -427,6 +503,9 @@ def main():
 
     # Model & Tokenizer Setup
     args, model = setup(args)
+    
+    #init wandb
+    WandbInit(params)
 
     # Training
     train(args, model, params)

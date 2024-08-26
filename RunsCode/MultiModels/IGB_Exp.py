@@ -255,7 +255,9 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, par
                 #train eval
                 train_result = evaluate(model, train_loader, 'Train', params)
                 WandB_logs(step+1, model) #log on wandb 
-                save_on_file(model, params)
+                save_on_file(model, params) #save stats on files
+                
+                
                 history.append(test_result) 
 
             
@@ -536,7 +538,7 @@ class DeviceDataLoader():
     
    
 #device = get_default_device()
-device = "cuda:1" if torch.cuda.is_available() else "cpu" 
+device = "cuda:0" if torch.cuda.is_available() else "cpu" 
 #device = "cpu"
 print(device)
 
@@ -1952,7 +1954,7 @@ elif IGB_Sel_criterion=='GammaProxy':
     if not os.path.exists(FolderPath):
         os.makedirs(FolderPath, exist_ok=True)         
     #then we create the specific sample folder
-    FolderPath = FolderPath +'/LR' + str(args.learning_rate) + '/KS' + str(args.ks) +  '/Slope' + str(args.Relu_Slope) + '/Data_Shift' + str(shift_const) + '/Sample' + str(args.SampleIndex)
+    FolderPath = FolderPath +'/LR' + str(args.lr) + '/KS' + str(args.ks) +  '/Slope' + str(args.Relu_Slope) + '/Data_Shift' + str(shift_const) + '/Sample' + str(args.SampleIndex)
     print('La cartella creata per il sample ha come path: ', FolderPath)
     if not os.path.exists(FolderPath):
         os.makedirs(FolderPath, exist_ok=True) 

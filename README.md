@@ -25,6 +25,16 @@ This folder contains all the codes used to perform experiments. It includes subf
 - **`ViT/`**
   - This subfolder contains an adaptation of the [ViT-pytorch repository](https://github.com/jeonsworld/ViT-pytorch), which is a PyTorch reimplementation of Google's [Vision Transformer (ViT) repository](https://github.com/google-research/vision_transformer). This serves as an example of how the code for a specific project can be re-adapted to investigate IGB.
 
+**Note:** This version of the repository does not use the `apex` package. If you wish to integrate `apex` for mixed-precision training or distributed training, follow these steps:
+
+1. Search for code blocks marked with `#avoid apex`.
+2. Uncomment the code within those blocks to enable `apex` functionality.
+3. Comment out the alternative code blocks immediately following them, which are designed to work without `apex`.
+
+By doing this, you can switch back to using `apex` in the relevant sections of the code.
+
+
+
 ### `utils/`
 
 This folder contains essential functions and utilities required to integrate and perform experiments on IGB (Initial Guessing Bias). The key script within this folder is `IGB_utils.py`, which includes all the methods necessary for conducting experiments related to IGB. These utilities must be imported into the codes within the `RunsCode` folder to facilitate the experiments and analyses. For more details on how to properly integrate and use these utilities, refer to the [Study of the Learning Dynamics](#2-study-of-the-learning-dynamics) section.
@@ -34,7 +44,7 @@ This folder contains essential functions and utilities required to integrate and
 The repository includes a `requirements.txt` file located in the root directory. This file lists all the Python packages required to run the codes in this repository. To install these dependencies, run the following command from the project root:
 
 ```bash
-pip install -r requirements.txt
+pip install --upgrade -r requirements.txt
 ```
 
 ## Running the Code

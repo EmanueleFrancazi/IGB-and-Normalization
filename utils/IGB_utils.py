@@ -112,6 +112,35 @@ def CustomizedX_Axis():
     #wandb.define_metric("GradientAngles/*", step_metric="GradientAngles/True_Steps_+_1")  
 
 
+
+#%%% Init WandB
+def WandbInit(params):
+    ProjName = 'ProvExt_Optim_{}_GradNorm_{}_IGB_Net_{}_Dataset_{}'.format(OptimFlag,GradNormMode, Architecture, ds)  #the project refers to all the simulations we would like to compare
+    GroupName = '/Aug_IGB_{}_lr_{}_Bs_{}_KS_{}_DS_{}~'.format( IGB_Mode, learning_rate, batch_size, ks, shift_const) #the group identifies the simulations we would like to average togheter for the representation
+    RunName = '/Sample' + str(params['SampleIndex'])  #the run name identify the single run belonging to the above broad categories
+    WandbId = wandb.util.generate_id()
+    
+    
+    #we define a list of tags that we can use for group more easly runs on wandb
+    #we list all the relevant parameter as tag
+    tags = ["LR_{}".format(learning_rate), "BS_{}".format(batch_size), "IGB_{}".format(IGB_Mode), 'KS_{}'.format(params['ks']), 'DS_{}'.format(shift_const), 'IGB_Level_{}'.format(IGB_Sel_Mode)]
+    
+    run = wandb.init(project= ProjName, #PCNSGD_vs_SGD #CNN_PCNSGD_VS_SGD
+               group =  GroupName,#with the group parameter you can organize runs divide them into groups
+               #job_type="ImbRatio_{}_lr_{}_Bs_{}_GF_{}_DP_{}_Classes_1_9".format(UnbalanceFactor,learning_rate, batch_size, group_factor, dropout_p) , #specify a subsection inside a simulation group
+               #dir = compl_wandb_dir,
+               tags = tags,
+               notes="experiments to compare the effect of IGB on MLP with a balanced dataset",
+               entity= "emanuele_francazi", #"gpu_runs", #
+               name = RunName,
+               id = WandbId, #you can use id to resume the corresponding run; to do so you need also to express the resume argument properly
+               resume="allow"
+               #sync_tensorboard=True,
+               ,reinit=True #If you're trying to start multiple runs from one script, add two things to your code: (1) run = wandb.init(reinit=True): Use this setting to allow reinitializing runs
+               )
+    
+
+
 #%%% logging into wandb server 
 def WandB_logs(Time, model):
     """
@@ -308,13 +337,17 @@ class ImageClassificationBase(nn.Module):
     def training_step(self, batch, num_data_points, params):
         images, labels = batch 
         #images = images.double()
-        out = self(images)                  # Generate predictions (because ResNet9 (the model class inherit ImageClassificationBase)): when you use self() in pytorch it looks for forward method (defined in ResNet9 class)
-        if params['Loss_function']=='Hinge':
-            hinge = HingeLoss()
-            loss = hinge(out.squeeze(), labels, reduction='mean')
-        elif params['Loss_function']=='CrossEntropy':
-            loss = F.cross_entropy(out, labels) # Calculate loss
-        
+        if params['Architecture']=='ViT_Ext_Repo':
+            loss = torch.mean(self(images, labels)['loss'])
+            
+        else:    
+            out = self(images)                  # Generate predictions (because ResNet9 (the model class inherit ImageClassificationBase)): when you use self() in pytorch it looks for forward method (defined in ResNet9 class)
+            if params['Loss_function']=='Hinge':
+                hinge = HingeLoss()
+                loss = hinge(out.squeeze(), labels, reduction='mean')
+            elif params['Loss_function']=='CrossEntropy':
+                loss = F.cross_entropy(out, labels) # Calculate loss
+            
         return {'loss': loss}#{'loss': loss, 'train_f': f}
 
     def StoringVariablesCreation(self):
@@ -395,44 +428,52 @@ class ImageClassificationBase(nn.Module):
             num_classes = len(params['label_list'])
             #print("CHECK", label_list, num_classes)
             n_batch, batch = en_batch
+            batch = tuple(t.to(params['device']) for t in batch)
             images, labels = batch 
             #images = images.double() 
-            out = self(images)                    # Generate predictions
             
-            if params['Loss_function']=='Hinge':
-                hinge = HingeLoss()
-                #print('dimension: ', out.squeeze(), labels, labels*out.squeeze())
-                loss = hinge(out.squeeze(), labels, reduction='none')
-            elif params['Loss_function']=='CrossEntropy':
-                loss = F.cross_entropy(out, labels, reduction='none') # Calculate loss
-            
-            pc_loss = per_class_loss(loss, labels, num_classes, classes_num, params)
-            
-            if mode=='KickStart':
-                #define a dummy temp optimizer just to reset gradients after grad norm storing 
-                optimizer = opt_func(self.parameters(), 0.)
-
-                BatchGradNorm=0
-                loss.mean().backward()
+            if params['Architecture']=='ViT_Ext_Repo':
+                loss = self(images, labels)['loss']
+                pc_loss = per_class_loss(loss, labels, num_classes, classes_num, params)
+                out = self(images, labels)['out']
                 
-                #for the first Batch we save the grad layer norm at init
-
-                if n_batch==0:
-                    LayerNormGrad(self)
+            else:    
+                out = self(images)                    # Generate predictions
                 
+                if params['Loss_function']=='Hinge':
+                    hinge = HingeLoss()
+                    #print('dimension: ', out.squeeze(), labels, labels*out.squeeze())
+                    loss = hinge(out.squeeze(), labels, reduction='none')
+                elif params['Loss_function']=='CrossEntropy':
+                    loss = F.cross_entropy(out, labels, reduction='none') # Calculate loss
+                
+                pc_loss = per_class_loss(loss, labels, num_classes, classes_num, params)
+                
+                if mode=='KickStart':
+                    #define a dummy temp optimizer just to reset gradients after grad norm storing 
+                    optimizer = opt_func(self.parameters(), 0.)
+    
+                    BatchGradNorm=0
+                    loss.mean().backward()
+                    
+                    #for the first Batch we save the grad layer norm at init
+    
+                    if n_batch==0:
+                        LayerNormGrad(self)
+                    
+                        
+                    
+                    parameters = [p for p in self.parameters() if p.grad is not None and p.requires_grad]
+                    for p in parameters:
+                        param_norm = p.grad.detach().data.norm(2)
+                        BatchGradNorm += param_norm.item() ** 2
+                    BatchGradNorm = BatchGradNorm ** 0.5  
+                    
+                    self.GradNorm[0] += BatchGradNorm/params['num_tr_batches']
+                    
+                    optimizer.zero_grad() #reset gradient before next step
                     
                 
-                parameters = [p for p in self.parameters() if p.grad is not None and p.requires_grad]
-                for p in parameters:
-                    param_norm = p.grad.detach().data.norm(2)
-                    BatchGradNorm += param_norm.item() ** 2
-                BatchGradNorm = BatchGradNorm ** 0.5  
-                
-                self.GradNorm[0] += BatchGradNorm/params['num_tr_batches']
-                
-                optimizer.zero_grad() #reset gradient before next step
-                
-            
             loss = torch.sum(loss) #reaggregate the loss for the global stats
 
             
@@ -955,25 +996,28 @@ def LayerNormGrad(model):
 
 #transform the input value token from outside rin a variable
 p = argparse.ArgumentParser(description = 'Sample index')
-p.add_argument('SampleIndex', help = 'Sample index')
-p.add_argument('FolderName', type = str, help = 'Name of the main folder where to put the samples folders')
-p.add_argument('learning_rate', type = float, help = 'learning rate (hyperparameter) selected for the run')
-p.add_argument('batch_size', type = int, help = 'Batch size (hyperparameter) selected for the run')
-p.add_argument('ks', type = int, help = 'kernel size for the MaxPool layer (if present)')
-p.add_argument('Relu_Slope', type = float, help = 'slope to assign to the customized ReLU (if present)')
-p.add_argument('Data_Shift_Constant', type = float, help ='shifting constant used for data standardization')
+p.add_argument('--SampleIndex', help = 'Sample index')
+p.add_argument('--FolderName', type = str, help = 'Name of the main folder where to put the samples folders')
+p.add_argument('--lr', type = float, help = 'learning rate (hyperparameter) selected for the run')
+p.add_argument('--batch_size', type = int, help = 'Batch size (hyperparameter) selected for the run')
+p.add_argument('--ks', type = int, help = 'kernel size for the MaxPool layer (if present)')
+p.add_argument('--Relu_Slope', type = float, help = 'slope to assign to the customized ReLU (if present)')
+p.add_argument('--Data_Shift_Constant', type = float, help ='shifting constant used for data standardization')
 
 
 
-args = p.parse_args()
+#args = p.parse_args()
 
-print('first parameter (run index) passed from the script is: ', args.SampleIndex)
-print('second parameter (Output Folder) passed from the script is: ', args.FolderName)
+# Parse known arguments
+args0, unknown0 = p.parse_known_args()
+
+print('first parameter (run index) passed from the script is: ', args0.SampleIndex)
+print('second parameter (Output Folder) passed from the script is: ', args0.FolderName)
 
 print("The PID of the main code is: ", os.getpid())
 
-ReLU_Slope= args.Relu_Slope
-shift_const=args.Data_Shift_Constant
+ReLU_Slope= args0.Relu_Slope
+shift_const=args0.Data_Shift_Constant
 
 TrainMode = 'ON' #if 'ON' pefrorm also training otherwise just init stats
 
@@ -989,7 +1033,7 @@ FixedStepSizeFlag= 'OFF' # can be 'ON' or 'OFF' depending if we want or not to t
 
 FixStepSize= 0.0005
 
-Architecture = 'MLP_mixer2' #can be 'MLP' or 'MLP-mixer' or 'BaseCNN' or 'ViT' or 'ResNet' 'MLP_mixer2'
+Architecture = 'ViT_Ext_Repo' #can be 'MLP' or 'MLP-mixer' or 'BaseCNN' or 'ViT' or 'ResNet' 'MLP_mixer2' 'ViT_Ext_Repo'
 
 Loss_function='CrossEntropy' #can be hinge or CrossEntropy or Hinge
 
@@ -1014,8 +1058,8 @@ SigmasStatsFlag='OFF' #set a flag to decide if to compute prel. Stat to estimate
 
 ImbalanceFactor= 1. #if we want to select a subset of elements for each class according to an imbalance factor (set on 1 to have balanced datasets)
 
-epochs = 20000
-learning_rate = args.learning_rate
+epochs = 4000
+learning_rate = args0.lr
 grad_clip = None #0.1
 weight_decay = 0. #1e-4
 
@@ -1025,8 +1069,8 @@ elif OptimFlag=='Adam':
     opt_func = torch.optim.Adam
     
     
-batch_size = args.batch_size
-ks = args.ks
+batch_size = args0.batch_size
+ks = args0.ks
 
 #opt_func = torch.optim.AdamW
 #grad_clip = 0.1

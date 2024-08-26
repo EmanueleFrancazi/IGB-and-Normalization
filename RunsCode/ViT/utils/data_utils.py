@@ -7,6 +7,8 @@ from torch.utils.data import DataLoader, RandomSampler, DistributedSampler, Sequ
 
 from torchvision.datasets import ImageFolder
 
+import numpy as np
+
 
 
 logger = logging.getLogger(__name__)
@@ -41,12 +43,12 @@ def get_loader(args):
     
     train_transform = []
     
-    train_tfms = transforms.Compose([transforms.RandomCrop(32, padding=4, padding_mode='reflect'), 
+    train_tfms = transforms.Compose([transforms.RandomResizedCrop((args.img_size, args.img_size), scale=(0.05, 1.0)), 
                              transforms.RandomHorizontalFlip(), 
                              transforms.ToTensor(), 
                              transforms.Normalize(*stats,inplace=True)])
     
-    valid_tfms = transforms.Compose([transforms.ToTensor(), transforms.Normalize(*stats)])
+    valid_tfms = transforms.Compose([transforms.Resize((args.img_size, args.img_size)), transforms.ToTensor(), transforms.Normalize(*stats)])
 
     
 
@@ -97,5 +99,9 @@ def get_loader(args):
     data['test_loader'] = test_loader
     data['num_trdata_points'] =  len(trainset)
     data['num_valdata_points'] =  len(testset)
+    data['input_size'] = np.prod(trainset[0][0].shape)
+    data['train_ds'] =  trainset
+    data['test_ds'] = testset
+
 
     return data

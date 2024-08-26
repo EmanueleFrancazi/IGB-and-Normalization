@@ -24,12 +24,12 @@ from .modeling_resnet import ResNetV2
 
 import sys
 import os
-
+"""
 # Dynamically add the project root (two levels up) to sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.abspath(os.path.join(current_dir, '..', '..'))
+project_root = os.path.abspath(os.path.join(current_dir, '..','..', '..'))
 sys.path.insert(0, project_root)
-
+"""
 from utils.IGB_utils import *
 
 
@@ -276,6 +276,9 @@ class VisionTransformer(ImageClassificationBase):
     def __init__(self, config, img_size=224, num_classes=21843, zero_head=False, vis=False):
         super(VisionTransformer, self).__init__()
         self.num_classes = num_classes
+        
+        self.n_outputs=self.num_classes #to ensure compatibility with wandb function (consider to change in the function with n_classes or param[] variable)
+        
         self.zero_head = zero_head
         self.classifier = config.classifier
 
@@ -283,21 +286,28 @@ class VisionTransformer(ImageClassificationBase):
         self.head = Linear(config.hidden_size, num_classes)
 
     def forward(self, x, labels=None):
+        out = {}
+        
         x, attn_weights = self.transformer(x)
         logits = self.head(x[:, 0])
-
+        out['out'] = logits
+        #print('out', out['out'])
         if labels is not None:
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss(reduction='none')
             loss = loss_fct(logits.view(-1, self.num_classes), labels.view(-1))
-            return loss
+            out['loss'] = loss
+            #print('losses :', out['loss'])
+            return out
         else:
             return logits, attn_weights
 
     def load_from(self, weights):
         with torch.no_grad():
             if self.zero_head:
-                nn.init.zeros_(self.head.weight)
+                #nn.init.zeros_(self.head.weight)
                 nn.init.zeros_(self.head.bias)
+                nn.init.kaiming_normal_(self.head.weight)
+                #nn.init.kaiming_normal_(self.head.bias)
             else:
                 self.head.weight.copy_(np2th(weights["head/kernel"]).t())
                 self.head.bias.copy_(np2th(weights["head/bias"]).t())
