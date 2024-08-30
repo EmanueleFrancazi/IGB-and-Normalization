@@ -460,7 +460,7 @@ def main():
     # fix the steps for eval measures
     N_ValidSteps=30
     num_tr_batches = len(train_loader)
-    TimeValSteps= ValidTimes(args.num_steps, num_tr_batches, N_ValidSteps)
+    TimeValSteps= ValidTimes(args.num_steps, num_tr_batches//args.gradient_accumulation_steps, N_ValidSteps)
     print('epochs with validation: ', TimeValSteps)
         
     # wrapping flags/variables from IGB_utils.py
@@ -480,11 +480,11 @@ def main():
 
     # Setup CUDA, GPU & distributed training
     if args.local_rank == -1:
-        device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
         args.n_gpu = torch.cuda.device_count()
     else:  # Initializes the distributed backend which will take care of sychronizing nodes/GPUs
         torch.cuda.set_device(args.local_rank)
-        device = torch.device("cuda:1", args.local_rank)
+        device = torch.device("cuda:0", args.local_rank)
         torch.distributed.init_process_group(backend='nccl',
                                              timeout=timedelta(minutes=60))
         args.n_gpu = 1

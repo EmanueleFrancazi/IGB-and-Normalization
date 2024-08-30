@@ -64,7 +64,8 @@ def get_loader(args):
 
     elif args.dataset == "CatsVsDogs":
         
-        data_dir='/home/EAWAG/francaem/restored/data/Cifar10_Kaggle_link/Cats_Dogs'
+        #data_dir='/home/EAWAG/francaem/restored/data/Cifar10_Kaggle_link/Cats_Dogs'
+        data_dir="/cluster/home/efrancazi/Data/Cat_vs_Dog/cifar10"
         trainset = ImageFolder(data_dir+'/train', train_tfms)
         testset = ImageFolder(data_dir+'/test', valid_tfms)
 
