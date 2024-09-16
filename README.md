@@ -21,6 +21,18 @@ This folder contains all the codes used to perform experiments. It includes subf
     ```
 
     This command will perform the simulation for multiple samples, indexed between `n1` and `n2`.
+    
+- **`ResNet/`**
+  - This folder contains an additional implementation of ResNet, based on the repository available at [Kaggle - CIFAR10 ResNet](https://www.kaggle.com/code/kmldas/cifar10-resnet-90-accuracy-less-than-5-min). Although ResNet is already implemented in **`MultiModels/`**, this separate version is provided for easier reproducibility of experiments that specifically use this ResNet model, as referenced in the article.
+
+  - **Note:** To reproduce experiments comparing the dynamics of models with BatchNorm applied before or after the activation function, you don't need to manually modify the architecture. You can simply set the `NormPos` flag as needed (e.g., `NormPos = 'After'`), as explained in the code.
+
+  - The running procedure for experiments with ResNet is identical to that in **`MultiModels/`**. For detailed instructions on setting hyperparameters and launching runs, refer to the [**MultiModels/**](#multimodels) section. The same commands and approach can be used for ResNet:
+
+    ```bash
+    ./RunsCode/ResNet/PythonRunManager.sh n1 n2 > code.out 2> code.err &
+    ```
+
 
 - **`ViT/`**
   - This subfolder contains an adaptation of the [ViT-pytorch repository](https://github.com/jeonsworld/ViT-pytorch), which is a PyTorch reimplementation of Google's [Vision Transformer (ViT) repository](https://github.com/google-research/vision_transformer). This serves as an example of how the code for a specific project can be re-adapted to investigate IGB.

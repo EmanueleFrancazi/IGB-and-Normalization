@@ -227,10 +227,7 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, par
             optimizer.step() #update weights
             
             
-            # Record & update learning rate
-            #lrs.append(get_lr(optimizer))
-            
-            sched.step()
+
 
             if (step+1) in ValChecks:      # Validation phase
                 
@@ -264,6 +261,17 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, par
             step+=1
             optimizer.zero_grad() #reset gradient before next step
         #model.dataset_guess_wrap(TrRes)
+        
+        # Record & update learning rate
+        #lrs.append(get_lr(optimizer))
+        
+        sched.step()
+
+        # Log the current learning rate and T_cur
+        current_lr = sched.get_last_lr()[0]  # Get the current learning rate
+        print(f"Epoch {epoch}: Learning Rate = {current_lr}")
+
+        
     #print('last step performed was: ', step)
         
 
