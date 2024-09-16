@@ -230,6 +230,9 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, par
 
 
             if (step+1) in ValChecks:      # Validation phase
+
+                model.LR.append(sched.get_last_lr()[0]) #save learning rate
+
                 
                 #first we save the norm of the gradient used for the step and the corresponding step size
                 total_norm = 0

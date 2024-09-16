@@ -379,6 +379,8 @@ class ImageClassificationBase(nn.Module):
         
         self.time=[]
 
+        self.LR=[]
+
     #defining same methods as below restricted to the guesses computation in order to repeat the computation for the train set
     """
     #included in training_step
@@ -649,7 +651,9 @@ def save_on_file(model, params):
     with open(params['FolderPath'] + "/StepSize.txt", "w") as f:
         np.savetxt(f, np.array(model.StepSize), delimiter = ',') 
         
-
+    with open(params['FolderPath'] + "/LR.txt", "w") as f:
+        np.savetxt(f, np.array(model.LR), delimiter = ',') 
+        
 
 
 
