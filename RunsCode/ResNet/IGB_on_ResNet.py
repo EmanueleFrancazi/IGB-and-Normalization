@@ -417,6 +417,8 @@ class ImageClassificationBase(nn.Module):
         self.GradNorm.append(0)
         self.StepSize=[]
         
+        self.LR=[]
+        
         self.Weights_Layer_grad = []
         self.Biases_Layer_grad = []
 
@@ -674,6 +676,9 @@ def save_on_file():
     with open(params['FolderPath'] + "/StepSize.txt", "w") as f:
         np.savetxt(f, np.array(model.StepSize), delimiter = ',') 
         
+    with open(params['FolderPath'] + "/LR.txt", "w") as f:
+        np.savetxt(f, np.array(model.LR), delimiter = ',') 
+        
 
 def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, device, params,
                   weight_decay=0, grad_clip=None, opt_func=torch.optim.SGD):
@@ -729,6 +734,8 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
             
             if (step+1) in ValChecks:      # Validation phase
                 
+                model.LR.append(sched.get_last_lr()[0]) #save learning rate
+            
                 #first we save the norm of the gradient used for the step and the corresponding step size
                 total_norm = 0
                 parameters = [p for p in model.parameters() if p.grad is not None and p.requires_grad]
