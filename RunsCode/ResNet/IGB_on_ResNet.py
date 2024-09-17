@@ -52,6 +52,10 @@ import time
 import copy
 
 
+
+from scipy.optimize import curve_fit #to fit sched for having a LR sched that do not depends on the number of epochs
+
+
 #fixing initial times to calculate the total time of the cycle
 start_TotTime = time.time()
 
@@ -679,6 +683,60 @@ def save_on_file():
     with open(params['FolderPath'] + "/LR.txt", "w") as f:
         np.savetxt(f, np.array(model.LR), delimiter = ',') 
         
+        
+        
+        
+def cosine_annealing_lr(lr_initial, N_fix, eta_min):
+    """
+    Generate learning rate values using a cosine annealing schedule.
+
+    Parameters:
+    - lr_initial (float): Starting learning rate.
+    - N_fix (int): Number of steps to generate learning rates for.
+    - eta_min (float): Minimum learning rate after annealing.
+
+    Returns:
+    - numpy.ndarray: Array of learning rate values at each step.
+    """
+    # Initialize a dummy optimizer (no actual parameters needed)
+    DummyOptimizer = opt_func(model.parameters(), lr_initial, weight_decay=weight_decay)
+    # Set up the cosine annealing scheduler
+    DummyScheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        DummyOptimizer, T_max=N_fix, eta_min=eta_min
+    )
+
+    lr_points = []
+    for _ in range(N_fix):
+        DummyOptimizer.step()  # Dummy optimizer step
+        lr_points.append(DummyOptimizer.param_groups[0]['lr'])
+        DummyScheduler.step()  # Update learning rate
+
+    return np.array(lr_points)
+        
+        
+def sigmoid_decay_function(x, a, b, c):
+    """
+    Sigmoid decay function for smooth, gradual decay.
+
+    Parameters:
+    - x (float or array-like): Input steps or epochs.
+    - a (float): Maximum value (starting point).
+    - b (float): Steepness of the decay.
+    - c (float): Center point where decay occurs most rapidly.
+
+    Returns:
+    - float or array-like: Decayed value(s) at step(s) `x`.
+    
+    Example:
+    >>> x_vals = np.linspace(0, 100, 100)
+    >>> y_vals = sigmoid_decay_function(x_vals, a=1, b=0.1, c=50)
+    >>> plt.plot(x_vals, y_vals)
+    >>> plt.show()
+    """
+    return a / (1 + np.exp(-b * (x - c)))
+
+        
+        
 
 def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, device, params,
                   weight_decay=0, grad_clip=None, opt_func=torch.optim.SGD):
@@ -707,6 +765,36 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
     # Set up one-cycle learning rate scheduler
     #sched = torch.optim.lr_scheduler.OneCycleLR(optimizer, max_lr, epochs=epochs, steps_per_epoch=len(train_loader))
     step=0
+    
+    
+    
+    if SchedTail=='FittedSigmoidDecay':
+        
+        
+        lr_points = cosine_annealing_lr(max_lr, N_fix, eta_min)
+        
+        # Create an array of the corresponding x values (e.g., current step index)
+        Tcur = np.arange(1, N_fix + 1)
+        
+        # Fit the sigmoid function to the generated points
+        p0 = [0.1, 1, N_fix // 2]  # Initial guesses for a, b, and c
+        
+        params, _ = curve_fit(sigmoid_decay_function, Tcur, lr_points, p0=p0, maxfev=2000)
+        
+        # Step 5: Generate the points for the whole range [1, N_max] using the fitted sigmoid function
+        N_max = epochs  # N_max > N_fix, we want to generate the whole set
+        whole_Tcur = np.arange(1, N_max + 1)
+        fitted_lr_points_full_range = sigmoid_decay_function(whole_Tcur, *params)            
+            
+        
+        # Define a lambda function to use the precomputed learning rates
+        # Create a lambda function that will return the correct learning rate for each epoch
+        lr_lambda = lambda epoch: fitted_lr_points_full_range[epoch]
+        
+        #Use LambdaLR with the custom lambda function
+        sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    
     for epoch in range(epochs):
         # Training Phase 
         model.train()
@@ -765,9 +853,25 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
             optimizer.zero_grad() #reset gradient before next step
         #model.dataset_guess_wrap(TrRes)
 
-        # Record & update learning rate
-        #lrs.append(get_lr(optimizer))
-        sched.step()
+
+
+        if SchedTail=='Const':
+            
+        	#modify the learning rate with the sched. only for the amount of epochs covered by the repo; from that point on keep it constant:
+            if epoch < N_fix:
+                # Record & update learning rate
+                #lrs.append(get_lr(optimizer))
+                sched.step()  
+                
+        elif SchedTail=='FittedSigmoidDecay':
+            # Record & update learning rate
+            #lrs.append(get_lr(optimizer))
+            sched.step() 
+
+        else:
+            # Record & update learning rate
+            #lrs.append(get_lr(optimizer))
+            sched.step()
            
         # Log the current learning rate and T_cur
         current_lr = sched.get_last_lr()[0]  # Get the current learning rate
@@ -1068,6 +1172,21 @@ SplittingStats='OFF' #if 'ON' splits the stats according to the class with bigge
 AugmentationFlag='OFF'
 
 NormPos = 'After'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
+
+
+
+#scheduler variables
+
+#if we want to set the learning scheduler and increase the number of epochs for some schedulers we get the problem due to the fact that the scheduling depends from the number of epochs (e.g. CosineAnnealing)
+#therefore we seth a method to fit lr w.r.t. a given reference (number of epoch of a reference simulation, e.g. performed on a repo) and just select points for the scheduling on the fitted curve
+
+SchedTail='FittedSigmoidDecay' # can be 'FittedSigmoidDecay', 'Const', 'Off'
+
+#Generate the first N_fix points using the CosineAnnealingLR scheduler
+N_fix = 50  # Fix T_max = N_fix
+eta_min = 1e-6
+
+
 
 
 ImbalanceFactor= 1. #if we want to select a subset of elements for each class according to the an imbalance factor (set on 1 to have balanced datasets)
