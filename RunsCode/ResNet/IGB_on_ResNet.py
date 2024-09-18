@@ -735,7 +735,11 @@ def sigmoid_decay_function(x, a, b, c):
     """
     return a / (1 + np.exp(-b * (x - c)))
 
-        
+
+# Step 2: Define the modified fitting function where a = LR_1 - b
+def PowerLaw_fitting_function(x, b, c, LR_1):
+    a = LR_1 - b  # Ensure the first point matches the scheduler
+    return a + b * x**c        
         
 
 def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, device, params,
@@ -774,26 +778,59 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
         lr_points = cosine_annealing_lr(max_lr, N_fix, eta_min)
         
         # Create an array of the corresponding x values (e.g., current step index)
-        Tcur = np.arange(1, N_fix + 1)
+        Tcur = np.arange(0, N_fix )
         
         # Fit the sigmoid function to the generated points
         p0 = [0.1, 1, N_fix // 2]  # Initial guesses for a, b, and c
         
-        params, _ = curve_fit(sigmoid_decay_function, Tcur, lr_points, p0=p0, maxfev=2000)
+        FitParams, _ = curve_fit(sigmoid_decay_function, Tcur, lr_points, p0=p0, maxfev=2000)
+        
+        # Step 5: Generate the points for the whole range [1, N_max] using the fitted sigmoid function
+        N_max = epochs  # N_max > N_fix, we want to generate the whole set
+        whole_Tcur = np.arange(0, N_max + 1)
+        fitted_lr_points_full_range = sigmoid_decay_function(whole_Tcur, *FitParams)            
+        
+        print('LR schedule is : ', fitted_lr_points_full_range)
+        
+        # Define a lambda function to use the precomputed learning rates
+        # Create a lambda function that will return the correct learning rate for each epoch
+        lr_lambda = lambda epoch: fitted_lr_points_full_range[epoch] / max_lr
+        
+        #Use LambdaLR with the custom lambda function
+        sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+
+    elif SchedTail=='FittedPowerLawDecay':
+        
+        lr_points = cosine_annealing_lr(max_lr, N_fix, eta_min)
+        LR_1 = lr_points[0]  # The first learning rate from the scheduler
+
+        # Create an array of the corresponding x values (e.g., current step index)
+        Tcur = np.arange(1, N_fix + 1)
+        
+        # Fit the sigmoid function to the generated points
+        p0 = (0.05, -2)  # Initial guesses for b and c
+        
+        FitParams, _ = curve_fit(lambda x, b, c: PowerLaw_fitting_function(x, b, c, LR_1), 
+                              Tcur, lr_points, p0=p0, maxfev=2000)
         
         # Step 5: Generate the points for the whole range [1, N_max] using the fitted sigmoid function
         N_max = epochs  # N_max > N_fix, we want to generate the whole set
         whole_Tcur = np.arange(1, N_max + 1)
-        fitted_lr_points_full_range = sigmoid_decay_function(whole_Tcur, *params)            
-            
+        fitted_lr_points_full_range = PowerLaw_fitting_function(whole_Tcur, *FitParams, LR_1)        
+        
+        fitted_lr_points_full_range = np.insert(fitted_lr_points_full_range, 0, max_lr)  # Insert lr_initial at the start of fitted_lr_points_full_range
+
+        
+        print('LR schedule is : ', fitted_lr_points_full_range)
         
         # Define a lambda function to use the precomputed learning rates
         # Create a lambda function that will return the correct learning rate for each epoch
-        lr_lambda = lambda epoch: fitted_lr_points_full_range[epoch]
+        lr_lambda = lambda epoch: fitted_lr_points_full_range[epoch] / max_lr
         
         #Use LambdaLR with the custom lambda function
         sched = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-    
+     
     
     for epoch in range(epochs):
         # Training Phase 
@@ -867,7 +904,10 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
             # Record & update learning rate
             #lrs.append(get_lr(optimizer))
             sched.step() 
-
+        elif SchedTail=='FittedPowerLawDecay':
+            # Record & update learning rate
+            #lrs.append(get_lr(optimizer))
+            sched.step() 
         else:
             # Record & update learning rate
             #lrs.append(get_lr(optimizer))
@@ -1180,7 +1220,7 @@ NormPos = 'After'  # either 'After' or 'Before'; indicate the position of the no
 #if we want to set the learning scheduler and increase the number of epochs for some schedulers we get the problem due to the fact that the scheduling depends from the number of epochs (e.g. CosineAnnealing)
 #therefore we seth a method to fit lr w.r.t. a given reference (number of epoch of a reference simulation, e.g. performed on a repo) and just select points for the scheduling on the fitted curve
 
-SchedTail='FittedSigmoidDecay' # can be 'FittedSigmoidDecay', 'Const', 'Off'
+SchedTail='FittedPowerLawDecay' # can be 'FittedSigmoidDecay', 'Const','FittedPowerLawDecay' ,'Off'
 
 #Generate the first N_fix points using the CosineAnnealingLR scheduler
 N_fix = 50  # Fix T_max = N_fix
