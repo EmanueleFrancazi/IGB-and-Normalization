@@ -739,7 +739,9 @@ def sigmoid_decay_function(x, a, b, c):
 # Step 2: Define the modified fitting function where a = LR_1 - b
 def PowerLaw_fitting_function(x, b, c, LR_1):
     a = LR_1 - b  # Ensure the first point matches the scheduler
-    return a + b * x**c        
+    #print('VERIFICA', a + b * x**c)
+    return  a + b * x**c  # Use np.maximum for element-wise comparison
+
         
 
 def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, device, params,
@@ -820,7 +822,7 @@ def fit_one_cycle(epochs, ValChecks,max_lr, model, train_loader, val_loader, dev
         fitted_lr_points_full_range = PowerLaw_fitting_function(whole_Tcur, *FitParams, LR_1)        
         
         fitted_lr_points_full_range = np.insert(fitted_lr_points_full_range, 0, max_lr)  # Insert lr_initial at the start of fitted_lr_points_full_range
-
+        fitted_lr_points_full_range = np.maximum(1e-8, fitted_lr_points_full_range) #preventing negative value for the learning rate with a regularizer 
         
         print('LR schedule is : ', fitted_lr_points_full_range)
         
@@ -1211,7 +1213,7 @@ SplittingStats='OFF' #if 'ON' splits the stats according to the class with bigge
 
 AugmentationFlag='OFF'
 
-NormPos = 'After'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
+NormPos = 'Before'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
 
 
 
@@ -1649,7 +1651,7 @@ class DeviceDataLoader():
     
    
 #device = get_default_device()
-device = "cuda:0" if torch.cuda.is_available() else "cpu" 
+device = "cuda:1" if torch.cuda.is_available() else "cpu" 
 #device = "cpu"
 print(device)
 
@@ -3012,8 +3014,9 @@ with open('./TestClassesMaxf.txt', "a") as f:
 
 model.time.append(0)
 
-save_on_file()
+model.LR.append(learning_rate) #save learning rate (the initial value is fixed by variable learning_rate; during the dynamics the value change according to a scheduler)
 
+save_on_file()
 
 #%%TRAINING
 
