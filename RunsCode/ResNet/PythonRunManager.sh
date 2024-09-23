@@ -22,7 +22,7 @@ do
         		do
         			for LR in 0.01 #0.1 0.01 0.001                                                                                              
                 		do
-                                	for DS in 32. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
+                                	for DS in 4. #4. 2. 1. 0.5 0.  #0. 1 2 4 8 
                 					do
 
 						python3 IGB_on_ResNet.py $i $FolderName  $LR $BS $KS $RS $DS

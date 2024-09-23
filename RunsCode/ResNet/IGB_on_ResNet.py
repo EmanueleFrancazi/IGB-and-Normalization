@@ -1201,7 +1201,7 @@ Architecture = 'ResNet' #can be 'MLP' or 'MLP-mixer' or 'BaseCNN' or 'ViT' or 'R
 
 Loss_function='CrossEntropy' #can be hinge or CrossEntropy or Hinge
 
-ds = 'CatsVsDogs' #options so far: 'Gaussian', 'CatsVsDogs', 'ImbalancedGaussian' or 'Cifar10'
+ds = 'Cifar10' #options so far: 'Gaussian', 'CatsVsDogs', 'ImbalancedGaussian' or 'Cifar10'
 
 NormMode = 'BN' #4 possible modes: 'Shift'==add an offset to center the activated nodes, 'OFF'==No normalization, 'InitShift' == shift computed on the first batch and same statistics used for all the train steps 'BN' classic batch norm
 
@@ -1213,7 +1213,7 @@ SplittingStats='OFF' #if 'ON' splits the stats according to the class with bigge
 
 AugmentationFlag='OFF'
 
-NormPos = 'Before'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
+NormPos = 'After'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
 
 
 
@@ -1291,7 +1291,7 @@ if ds == 'CatsVsDogs':
     data_dir = '/home/EAWAG/francaem/restored/data/Cifar10_Kaggle_link/Cats_Dogs'
     #data_dir = '/cluster/home/efrancazi/Data/Cat_vs_Dog/cifar10'
 elif ds == 'Cifar10':
-    data_dir = '/home/EAWAG/francaem/restored/Prova/IGB/ICLR_rebuttal/Kaggle/data/cifar10'
+    data_dir = '/home/EAWAG/francaem/restored/data/Cifar10_Kaggle_link/cifar10'
 elif ds == 'Gaussian':
     data_dir = "/home/EAWAG/francaem/restored/data/GaussianBlobs/"
     
@@ -1651,7 +1651,7 @@ class DeviceDataLoader():
     
    
 #device = get_default_device()
-device = "cuda:1" if torch.cuda.is_available() else "cpu" 
+device = "cuda:0" if torch.cuda.is_available() else "cpu" 
 #device = "cpu"
 print(device)
 
@@ -2176,6 +2176,13 @@ def conv_block(in_channels, out_channels, NormFlag, layer_id, pool=False):
     if NormFlag=='BN':
     	if NormPos=='Before':
             layers.append(nn.BatchNorm2d(out_channels))
+            
+    elif NormFlag == 'LN':
+        #Using nn.LayerNorm directly with convolutional layers can be tricky because it requires knowledge of the input dimensions (height and width), which can vary.
+        #nn.GroupNorm with num_groups=1 normalizes over the channel dimension for each sample independently, similar to Layer Normalization.
+        if NormPos == 'Before':
+            layers.append(nn.GroupNorm(1, out_channels))
+            
     elif NormFlag=='Shift':
         layers.append(CustomBatchNorm2d())
     elif NormFlag=='InitShift':
