@@ -1201,9 +1201,9 @@ Architecture = 'ResNet' #can be 'MLP' or 'MLP-mixer' or 'BaseCNN' or 'ViT' or 'R
 
 Loss_function='CrossEntropy' #can be hinge or CrossEntropy or Hinge
 
-ds = 'Cifar10' #options so far: 'Gaussian', 'CatsVsDogs', 'ImbalancedGaussian' or 'Cifar10'
+ds = 'CatsVsDogs' #options so far: 'Gaussian', 'CatsVsDogs', 'ImbalancedGaussian' or 'Cifar10'
 
-NormMode = 'BN' #4 possible modes: 'Shift'==add an offset to center the activated nodes, 'OFF'==No normalization, 'InitShift' == shift computed on the first batch and same statistics used for all the train steps 'BN' classic batch norm
+NormMode = 'LN' #4 possible modes: 'Shift'==add an offset to center the activated nodes, 'OFF'==No normalization, 'InitShift' == shift computed on the first batch and same statistics used for all the train steps 'BN' classic batch norm, 'LN': classic layer norm
 
 OrderingClassesFlag='ON' #when set 'ON' order the weights raws of the last layer according to the IGB values such that classes with bigger guessing fraction have smaller node index
 
@@ -1213,7 +1213,7 @@ SplittingStats='OFF' #if 'ON' splits the stats according to the class with bigge
 
 AugmentationFlag='OFF'
 
-NormPos = 'After'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
+NormPos = 'Before'  # either 'After' or 'Before'; indicate the position of the normalization layer w.r.t. the activations
 
 
 
@@ -2914,7 +2914,7 @@ params['FolderPath'] = FolderPath #add a new param to the param dict
 #%%     WANDB INIT
 
 if SplittingStats=='ON':
-    ProjName = 'ImbCD_{}_GradNorm_IGB_Net_{}_Dataset_{}_IR_{}'.format(np.argmax(ds_out['val_f'].numpy()), Architecture, ds, ImbalanceFactor)  #the project refers to all the simulations we would like to compare
+    ProjName = 'CD_{}_IGB_Net_{}_Dataset_{}_IR_{}'.format(np.argmax(ds_out['val_f'].numpy()), Architecture, ds, ImbalanceFactor)  #the project refers to all the simulations we would like to compare
 else:
     ProjName = 'Ext_Optim_{}_GradNorm_{}_IGB_Net_{}_Dataset_{}'.format(OptimFlag,GradNormMode, Architecture, ds)  #the project refers to all the simulations we would like to compare
 GroupName = '/Aug_IGB_{}_lr_{}_Bs_{}_KS_{}_DS_{}~'.format( IGB_Mode, learning_rate, batch_size, ks, shift_const) #the group identifies the simulations we would like to average togheter for the representation
