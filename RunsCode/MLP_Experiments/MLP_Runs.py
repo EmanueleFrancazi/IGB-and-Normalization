@@ -242,10 +242,23 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     hidden_dim = 100
     output_dim = 2
 
-    filtering_mode = 'None'  # options: 'high_igb', 'low_igb', or 'none'
-    threshold = 0.1
+    # Define the threshold mapping based on filtering mode
+    threshold_map = {
+        'low_igb': 0.1,
+        'high_igb': 0.8,
+        'none': None
+    }
 
-    num_epochs = 20
+    # Set filtering mode
+    filtering_mode = 'high_igb'  # options: 'high_igb', 'low_igb', or 'none'
+
+    # Retrieve the threshold value based on filtering mode
+    threshold = threshold_map.get(filtering_mode, None)  # Default to None if filtering_mode is invalid
+
+    print(f"Filtering mode: {filtering_mode}, Threshold: {threshold}")
+
+
+    num_epochs = 40
     num_eval_points = 15
 
     # === Wandb initialization ===
@@ -253,10 +266,10 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     norm_config = param_config.get("norm_config")
     learning_rate = param_config["learning_rate"]
     batch_size = param_config["batch_size"]
-    group_name = f'NormMode_{norm_config}_depth_{num_hidden_layers}_lr_{learning_rate}_Bs_{batch_size}'
+    group_name = f'NormMode_{norm_config}_depth_{num_hidden_layers}_lr_{learning_rate}_Bs_{batch_size}_Filtering_{filtering_mode}'
     run_name   = f'Sample{sample_index}'
     wandb_id   = wandb.util.generate_id()
-    tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}"]
+    tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}", f"Filtering_{filtering_mode}"]
     
     run = wandb.init(project='MLP_exp_G_Blobs',
                      group=group_name,
@@ -301,26 +314,31 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     model = MLP(input_dim=dim, hidden_dim=hidden_dim, num_hidden_layers=num_hidden_layers,
                 output_dim=output_dim, norm_config=norm_config)
     model.to(device)
-    
+
     # === Filtering mode (if used) ===
     if filtering_mode.lower() == 'high_igb':
+        counter = 0  # Initialize counter for iterations
         while True:
+            counter += 1  # Increment counter at the beginning of each iteration
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff > threshold:
-                print(f"[Filtering mode High IGB] Condition met: diff = {diff:.4f}")
+                print(f"[Filtering mode High IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
             else:
-                print(f"[Filtering mode High IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights.")
+                #print(f"[Filtering mode High IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights. Iteration: {counter}")
                 model.init_weights()
     elif filtering_mode.lower() == 'low_igb':
+        counter = 0  # Initialize counter for iterations
         while True:
+            counter += 1  # Increment counter at the beginning of each iteration
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff < threshold:
-                print(f"[Filtering mode Low IGB] Condition met: diff = {diff:.4f}")
+                print(f"[Filtering mode Low IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
             else:
-                print(f"[Filtering mode Low IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights.")
+                #print(f"[Filtering mode Low IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights. Iteration: {counter}")
                 model.init_weights()
+
     else:
         print("[Filtering mode] No filtering is performed.")
     
@@ -341,18 +359,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     next_eval_idx = 0
     for epoch in range(num_epochs):
         for batch in train_loader:
-            model.train()
-            optimizer.zero_grad()
-            x_batch, y_batch = batch
-            x_batch = x_batch.to(device)
-            y_batch = y_batch.to(device)
-            outputs = model(x_batch)
-            loss = criterion_train(outputs, y_batch)
-            loss.backward()
-            optimizer.step()
-            
-            step_counter += 1
-            
+
             if next_eval_idx < len(eval_steps) and step_counter >= eval_steps[next_eval_idx]:
                 train_metrics = evaluate_dataset(model, train_dataset, criterion_eval, device,
                                                  set_type='train', eval_batch_size=128)
@@ -381,9 +388,21 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                     'Performance_measures/Test_Accuracy_Class_0': test_metrics[0]['accuracy'],
                     'Performance_measures/Test_Loss_Class_1': test_metrics[1]['loss'],
                     'Performance_measures/Test_Accuracy_Class_1': test_metrics[1]['accuracy'],
-                    'Performance_measures/True_Steps_+_1': step_counter
+                    'Performance_measures/True_Steps_+_1': step_counter + 1,
                 })
                 next_eval_idx += 1
+
+            model.train()
+            optimizer.zero_grad()
+            x_batch, y_batch = batch
+            x_batch = x_batch.to(device)
+            y_batch = y_batch.to(device)
+            outputs = model(x_batch)
+            loss = criterion_train(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            
+            step_counter += 1
 
     print("Training completed for this simulation.")
     wandb.finish()
@@ -398,8 +417,8 @@ def main():
     # Define a parameter grid for simulations.
     # To add/change parameters, simply modify this dictionary.
     param_grid = {
-        'learning_rate': [1e-3, 1e-2, 1e-1],
-        'batch_size': [64, 128, 256, 512],
+        'learning_rate': [1e-3], #[1e-3, 1e-2, 1e-1], #[1e-3],
+        'batch_size': [256], #[64, 128, 256, 512], #[128], 
         'num_hidden_layers': [10, 20, 30],
         'norm_config': ['bn_after']  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after'
     }
@@ -411,28 +430,29 @@ def main():
     base_log_dir = './logs'
     if not os.path.exists(base_log_dir):
         os.makedirs(base_log_dir)
-    
-    # For each parameter combination, create a subfolder and run n_experiments per combination.
-    n_experiments = 3  # number of independent runs per parameter combination (adjust as needed)
-    
-    for combo in combinations:
-        # Create a dictionary for the current parameter combination.
-        param_config = dict(zip(keys, combo))
-        # Create a folder name that encodes the parameter values.
-        combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}"
-        combo_log_dir = os.path.join(base_log_dir, combo_folder)
-        if not os.path.exists(combo_log_dir):
-            os.makedirs(combo_log_dir)
-        
-        print(f"Starting simulations for parameter combination: {param_config}")
-        for sample_index in range(1, n_experiments + 1):
+    # For each parameter combination, create a subfolder and run n_experiments per combination.    
+
+    n_experiments = 30  # number of independent runs (samples)
+
+    for sample_index in range(1, n_experiments + 1):
+        print(f"Starting simulation Sample {sample_index} for all parameter combinations...")
+        for combo in combinations:
+            # Create a dictionary for the current parameter combination.
+            param_config = dict(zip(keys, combo))
+            # Create a folder name that encodes the parameter values.
+            combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}"
+            combo_log_dir = os.path.join(base_log_dir, combo_folder)
+            if not os.path.exists(combo_log_dir):
+                os.makedirs(combo_log_dir)
+            
             sim_log_dir = os.path.join(combo_log_dir, f"Sample{sample_index}")
             if not os.path.exists(sim_log_dir):
                 os.makedirs(sim_log_dir)
-            print(f"  Running simulation Sample {sample_index} ...")
+            print(f"  Running simulation for parameter combination {param_config} ...")
             run_simulation(sim_log_dir, device, sample_index, param_config)
-            print(f"  Simulation Sample {sample_index} completed.\n")
-        print(f"Completed all simulations for combination: {param_config}\n")
+            print(f"  Simulation for parameter combination {param_config} completed.\n")
+        print(f"Completed all parameter combinations for simulation Sample {sample_index}\n")
+
 
 if __name__ == '__main__':
     main()
