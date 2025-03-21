@@ -233,13 +233,13 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     """
     # === Simulation parameters ===
     dim = 1000                      # number of components
-    center_val = 1.0 / np.sqrt(dim) # centers: [1/sqrt(dim), ...] and [-1/sqrt(dim), ...]
-    sigma2 = 1.0                    # variance
+    center_val = 5 #1.0 / np.sqrt(dim) # centers: [1/sqrt(dim), ...] and [-1/sqrt(dim), ...]
+    sigma2 = 0.1 #1.0                    # variance
     n_samples_train = 10000
     n_samples_test  = 200
 
     num_hidden_layers = param_config["num_hidden_layers"]
-    hidden_dim = 100
+    hidden_dim = 1000 #100
     output_dim = 2
 
     # Define the threshold mapping based on filtering mode
@@ -250,15 +250,16 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     }
 
     # Set filtering mode
-    filtering_mode = 'high_igb'  # options: 'high_igb', 'low_igb', or 'none'
+    filtering_mode = param_config["filtering_mode"]  # options: 'high_igb', 'low_igb', or 'none'
 
     # Retrieve the threshold value based on filtering mode
     threshold = threshold_map.get(filtering_mode, None)  # Default to None if filtering_mode is invalid
 
     print(f"Filtering mode: {filtering_mode}, Threshold: {threshold}")
+    max_attempts = 20000
 
 
-    num_epochs = 40
+    num_epochs = 15 #80
     num_eval_points = 15
 
     # === Wandb initialization ===
@@ -271,7 +272,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     wandb_id   = wandb.util.generate_id()
     tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}", f"Filtering_{filtering_mode}"]
     
-    run = wandb.init(project='MLP_exp_G_Blobs',
+    run = wandb.init(project=  'MLP_exp_G_Blobs_FraSetting', #'MLP_exp_G_Blobs_New',
                      group=group_name,
                      name=run_name,
                      id=wandb_id,
@@ -320,6 +321,13 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
         counter = 0  # Initialize counter for iterations
         while True:
             counter += 1  # Increment counter at the beginning of each iteration
+
+            # Check if maximum attempts have been reached
+            if counter > max_attempts:
+                print(f"[Filtering mode High IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
+                wandb.finish()
+                return  # Exit from run_simulation
+
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff > threshold:
                 print(f"[Filtering mode High IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
@@ -331,6 +339,13 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
         counter = 0  # Initialize counter for iterations
         while True:
             counter += 1  # Increment counter at the beginning of each iteration
+
+            # Check if maximum attempts have been reached
+            if counter > max_attempts:
+                print(f"[Filtering mode High IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
+                wandb.finish()
+                return  # Exit from run_simulation
+
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff < threshold:
                 print(f"[Filtering mode Low IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
@@ -411,16 +426,17 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
 # 7. Main: Outer loop over simulation experiments with a parameter grid
 #############################################
 def main():
-    device_str = 'cuda:0'  # or 'cpu'
+    device_str =  'cuda:1'  #'cuda:0'  # or 'cpu'
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
     
     # Define a parameter grid for simulations.
     # To add/change parameters, simply modify this dictionary.
     param_grid = {
-        'learning_rate': [1e-3], #[1e-3, 1e-2, 1e-1], #[1e-3],
-        'batch_size': [256], #[64, 128, 256, 512], #[128], 
-        'num_hidden_layers': [10, 20, 30],
-        'norm_config': ['bn_after']  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after'
+        'learning_rate': [0.00001], #[1e-4, 1e-3, 1e-2, 1e-1], #[1e-3],
+        'batch_size': [256],  #[64, 128, 256, 512], #[128], 
+        'num_hidden_layers': [1, 20], #[2, 15, 30],
+        'norm_config': [ 'bn_before', 'ln_before'], #['bn_after', 'bn_before', 'ln_after', 'ln_before'],  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after'
+        'filtering_mode': ['high_igb', 'low_igb'] # can be 'high_igb', 'low_igb', 'none'
     }
     
     # Use itertools.product to generate all parameter combinations.
@@ -440,7 +456,7 @@ def main():
             # Create a dictionary for the current parameter combination.
             param_config = dict(zip(keys, combo))
             # Create a folder name that encodes the parameter values.
-            combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}"
+            combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_Filt_{param_config['filtering_mode']}"
             combo_log_dir = os.path.join(base_log_dir, combo_folder)
             if not os.path.exists(combo_log_dir):
                 os.makedirs(combo_log_dir)
