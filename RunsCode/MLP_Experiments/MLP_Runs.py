@@ -7,6 +7,10 @@ from torch.utils.data import TensorDataset, DataLoader
 import wandb  # make sure to install wandb (pip install wandb)
 import itertools
 
+
+# Print the process ID
+print(f"Process ID: {os.getpid()}")
+
 #%%% CUSTOMIZE THE AXIS ASSOCIATED TO LOGGED METRICS (WANDB)
 def CustomizedX_Axis():
     """
@@ -219,6 +223,64 @@ def log_metrics(log_dir, step, train_metrics, test_metrics):
     log_value(log_dir, 'test_class1_loss.txt', test_metrics[1]['loss'])
     log_value(log_dir, 'test_class1_accuracy.txt', test_metrics[1]['accuracy'])
 
+
+
+def label_map_function(frac0, frac1):
+    """
+    Determine whether the output nodes should be swapped based on the initial guess fractions.
+
+    If fraction of guesses assigned to node 0 is already >= 0.5, no change needed.
+    If fraction assigned to node 1 is greater, nodes should be swapped.
+
+    Returns a dictionary indicating the label map.
+    """
+    if frac0 >= 0.5:
+        return {0: 0, 1: 1}  # No swap needed
+    else:
+        return {0: 1, 1: 0}  # Swap nodes
+
+
+def OrderOutputNodes(model, label_map):
+    """
+    Reorder the weights of the output nodes according to the provided label_map.
+    """
+    original_weights = model.output_layer.weight.data.clone()
+    original_bias = model.output_layer.bias.data.clone()
+
+    # Initialize new weights and bias tensors
+    new_weights = torch.zeros_like(original_weights)
+    new_bias = torch.zeros_like(original_bias)
+
+    # Reassign weights and biases based on label map
+    for new_idx, old_idx in label_map.items():
+        new_weights[new_idx] = original_weights[old_idx]
+        new_bias[new_idx] = original_bias[old_idx]
+
+    # Replace the weights and biases in the existing output layer
+    model.output_layer.weight.data = new_weights
+    model.output_layer.bias.data = new_bias
+
+
+
+def get_normalized_weights(model):
+    """
+    Extract all weight parameters from the model (ignoring biases),
+    flatten them into a single vector, and normalize the vector to have L2 norm = 1.
+    
+    This returns the normalized weights vector.
+    """
+    weight_list = []
+    for name, param in model.named_parameters():
+        if 'weight' in name:  # consider only parameters whose name includes 'weight'
+            weight_list.append(param.view(-1))
+    w = torch.cat(weight_list)
+    norm = torch.norm(w)
+    if norm > 0:
+        return w / norm
+    else:
+        return w
+
+
 #############################################
 # 6. Single simulation run (training + evaluation)
 #############################################
@@ -233,19 +295,38 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     """
     # === Simulation parameters ===
     dim = 1000                      # number of components
-    center_val = 5 #1.0 / np.sqrt(dim) # centers: [1/sqrt(dim), ...] and [-1/sqrt(dim), ...]
-    sigma2 = 0.1 #1.0                    # variance
+    center_val = 1.0 / np.sqrt(dim) #5 #1.0 / np.sqrt(dim) # centers: [1/sqrt(dim), ...] and [-1/sqrt(dim), ...]
+    sigma2 = 1.0   #0.1 #1.0                    # variance
     n_samples_train = 10000
-    n_samples_test  = 200
+    n_samples_test  = 500
 
     num_hidden_layers = param_config["num_hidden_layers"]
-    hidden_dim = 1000 #100
+    hidden_dim = 100 #100
     output_dim = 2
+
+
+    # === Compute Blobs Separation ===
+    # Define centers for two blobs: one positive and one negative
+    center_positive = np.full((dim,), center_val)
+    center_negative = -np.full((dim,), center_val)
+
+    # L2 distance between centers
+    L2_distance = np.linalg.norm(center_positive - center_negative)  # equals 2*center_val*sqrt(dim)
+
+    # Standard deviation from the variance sigma2
+    std_val = np.sqrt(sigma2)
+
+    # Normalized separation (BlobsSeparation)
+    BlobsSeparation = L2_distance / std_val
+    print(f"Blobs Separation (normalized): {BlobsSeparation}")
+
+
+
 
     # Define the threshold mapping based on filtering mode
     threshold_map = {
         'low_igb': 0.1,
-        'high_igb': 0.8,
+        'high_igb': 0.9,
         'none': None
     }
 
@@ -256,10 +337,10 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     threshold = threshold_map.get(filtering_mode, None)  # Default to None if filtering_mode is invalid
 
     print(f"Filtering mode: {filtering_mode}, Threshold: {threshold}")
-    max_attempts = 20000
+    max_attempts = 1000
 
 
-    num_epochs = 15 #80
+    num_epochs = 80 #15
     num_eval_points = 15
 
     # === Wandb initialization ===
@@ -270,9 +351,9 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     group_name = f'NormMode_{norm_config}_depth_{num_hidden_layers}_lr_{learning_rate}_Bs_{batch_size}_Filtering_{filtering_mode}'
     run_name   = f'Sample{sample_index}'
     wandb_id   = wandb.util.generate_id()
-    tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}", f"Filtering_{filtering_mode}"]
+    tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}", f"Filtering_{filtering_mode}", f"BlobsSeparation_{BlobsSeparation:.2f}"]
     
-    run = wandb.init(project=  'MLP_exp_G_Blobs_FraSetting', #'MLP_exp_G_Blobs_New',
+    run = wandb.init(project=  'MLP_exp_G_Blobs_Final', #'MLP_exp_G_Blobs_FraSetting', #'MLP_exp_G_Blobs_New',
                      group=group_name,
                      name=run_name,
                      id=wandb_id,
@@ -357,6 +438,31 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     else:
         print("[Filtering mode] No filtering is performed.")
     
+
+    # === Ordering Output Nodes to Assign Majority Guesses to Node 0 ===
+
+    OrderingClassesFlag = 'ON'  # Set to 'ON' to enable swapping, 'OFF' to disable
+
+    # Evaluate initial fractions of guesses assigned to each class after initialization
+    if OrderingClassesFlag == 'ON':
+        diff, frac0, frac1 = filtering_check(model, train_X, device)
+        print(f"Initial fractions before node ordering: frac0={frac0:.4f}, frac1={frac1:.4f}")
+
+        # Determine if reordering of output nodes is necessary
+        label_map = label_map_function(frac0, frac1)
+
+        # Apply the reordering
+        if label_map != {0: 0, 1: 1}:
+            print(f"Ordering output nodes as per label map: {label_map}")
+            OrderOutputNodes(model, label_map)
+        else:
+            print("No ordering of output nodes needed (node 0 already assigned to majority guesses).")
+    else:
+        print("OrderingClassesFlag is OFF. No ordering of output nodes performed.")
+
+
+
+
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion_train = nn.CrossEntropyLoss()
     criterion_eval  = nn.CrossEntropyLoss(reduction='none')
@@ -370,6 +476,9 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     eval_steps = np.unique(eval_steps).tolist()
     print("Evaluation will occur at steps:", eval_steps)
     
+    # Compute w0 by extracting all weight parameters, flattening, and normalizing.
+    w0 = get_normalized_weights(model).detach().cpu()
+
     step_counter = 0
     next_eval_idx = 0
     for epoch in range(num_epochs):
@@ -380,6 +489,17 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                                                  set_type='train', eval_batch_size=128)
                 test_metrics  = evaluate_dataset(model, test_dataset, criterion_eval, device,
                                                  set_type='test', eval_batch_size=128)
+                
+                # Compute current normalized weights (wt) in the same way as w0.
+                wt = get_normalized_weights(model).detach().cpu()
+                # Compute the scalar product between w0 and wt.
+                dot_product = torch.dot(w0, wt).item()
+                print(f"Step {step_counter}: w0 · wt = {dot_product:.4f}")
+                # Append the dot product value with the current step to a log file.
+                with open(os.path.join(sim_log_dir, "w0_wt_dot.txt"), "a") as f:
+                    f.write(f"{step_counter} {dot_product}\n")
+
+
                 print(f"Step {step_counter}: Train loss={train_metrics['global']['loss']:.4f}, " +
                       f"Train acc={train_metrics['global']['accuracy']:.4f} | " +
                       f"Test loss={test_metrics['global']['loss']:.4f}, Test acc={test_metrics['global']['accuracy']:.4f}")
@@ -403,6 +523,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                     'Performance_measures/Test_Accuracy_Class_0': test_metrics[0]['accuracy'],
                     'Performance_measures/Test_Loss_Class_1': test_metrics[1]['loss'],
                     'Performance_measures/Test_Accuracy_Class_1': test_metrics[1]['accuracy'],
+                    'w0_wt_dot': dot_product,
                     'Performance_measures/True_Steps_+_1': step_counter + 1,
                 })
                 next_eval_idx += 1
@@ -422,6 +543,51 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     print("Training completed for this simulation.")
     wandb.finish()
 
+
+
+
+def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000):
+    # Generate the training blob data once per configuration
+    n_samples_train = 10000
+    dim = 100
+    center_val = 1.0 / np.sqrt(dim)
+    sigma2 = 1.0
+    train_X, train_Y = generate_gaussian_blobs(n_samples_train, dim, center_val, sigma2, device)
+    train_dataset = TensorDataset(train_X, train_Y)
+
+    hidden_dim = 100
+    output_dim = 2
+    
+    # Define file path for storing the frac0 values for this configuration
+    log_file_path = os.path.join(combo_log_dir, 'init_frac0.txt')
+    
+    # For each independent initialization:
+    for experiment in range(1, n_experiments + 1):
+        # Create the model using current param_config (no filtering loop here)
+        model = MLP(input_dim=dim, hidden_dim=hidden_dim, num_hidden_layers=param_config["num_hidden_layers"],
+                    output_dim=output_dim, norm_config=param_config["norm_config"])
+        model.to(device)
+        
+        # Compute initial fractions without any reinitialization loop
+        diff, frac0, frac1 = filtering_check(model, train_X, device)
+        print(f"Experiment {experiment} for config {param_config}: Initial frac0 = {frac0:.4f}, frac1 = {frac1:.4f}")
+        
+        # Optionally perform ordering if desired
+        OrderingClassesFlag = 'ON'  # This flag can also come from param_config if needed
+        if OrderingClassesFlag == 'ON':
+            label_map = label_map_function(frac0, frac1)
+            if label_map != {0: 0, 1: 1}:
+                print(f"Ordering output nodes with label map: {label_map}")
+                OrderOutputNodes(model, label_map)
+                # Optionally recompute fractions after ordering:
+                diff, frac0, frac1 = filtering_check(model, train_X, device)
+        
+        # Append the frac0 value to the common log file for this configuration
+        with open(log_file_path, 'a') as f:
+            f.write(f"{frac0}\n")
+
+
+
 #############################################
 # 7. Main: Outer loop over simulation experiments with a parameter grid
 #############################################
@@ -429,46 +595,67 @@ def main():
     device_str =  'cuda:1'  #'cuda:0'  # or 'cpu'
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
     
+    # Set the RunMode flag:
+    RunMode = 'InitStatistics' #'Dynamics'  # or 'InitStatistics'
+
     # Define a parameter grid for simulations.
     # To add/change parameters, simply modify this dictionary.
     param_grid = {
+        'dataset': ['Gaussian', 'MNIST', 'CIFAR10'],
+        'offset_value': [0.0, 1, 5],
         'learning_rate': [0.00001], #[1e-4, 1e-3, 1e-2, 1e-1], #[1e-3],
-        'batch_size': [256],  #[64, 128, 256, 512], #[128], 
+        'batch_size': [512],  #[64, 128, 256, 512], #[128], 
         'num_hidden_layers': [1, 20], #[2, 15, 30],
-        'norm_config': [ 'bn_before', 'ln_before'], #['bn_after', 'bn_before', 'ln_after', 'ln_before'],  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after'
-        'filtering_mode': ['high_igb', 'low_igb'] # can be 'high_igb', 'low_igb', 'none'
+        'norm_config': ['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #[ 'bn_before', 'ln_before'], #['bn_after', 'bn_before', 'ln_after', 'ln_before'],  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after', 'none'
+        'filtering_mode': ['none'] # can be 'high_igb', 'low_igb', 'none'
     }
     
     # Use itertools.product to generate all parameter combinations.
     keys = list(param_grid.keys())
     combinations = list(itertools.product(*(param_grid[key] for key in keys)))
-    
-    base_log_dir = './logs'
-    if not os.path.exists(base_log_dir):
-        os.makedirs(base_log_dir)
-    # For each parameter combination, create a subfolder and run n_experiments per combination.    
 
-    n_experiments = 30  # number of independent runs (samples)
+    n_experiments = 5000  # number of independent runs (samples)
 
-    for sample_index in range(1, n_experiments + 1):
-        print(f"Starting simulation Sample {sample_index} for all parameter combinations...")
+    if RunMode == 'Dynamics':
+
+        base_log_dir = './logs'
+        if not os.path.exists(base_log_dir):
+            os.makedirs(base_log_dir)
+        # For each parameter combination, create a subfolder and run n_experiments per combination.    
+
+        
+
+        for sample_index in range(1, n_experiments + 1):
+            print(f"Starting simulation Sample {sample_index} for all parameter combinations...")
+            for combo in combinations:
+                # Create a dictionary for the current parameter combination.
+                param_config = dict(zip(keys, combo))
+                # Create a folder name that encodes the parameter values.
+                combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_Filt_{param_config['filtering_mode']}"
+                combo_log_dir = os.path.join(base_log_dir, combo_folder)
+                if not os.path.exists(combo_log_dir):
+                    os.makedirs(combo_log_dir)
+                
+                sim_log_dir = os.path.join(combo_log_dir, f"Sample{sample_index}")
+                if not os.path.exists(sim_log_dir):
+                    os.makedirs(sim_log_dir)
+                print(f"  Running simulation for parameter combination {param_config} ...")
+                run_simulation(sim_log_dir, device, sample_index, param_config)
+                print(f"  Simulation for parameter combination {param_config} completed.\n")
+            print(f"Completed all parameter combinations for simulation Sample {sample_index}\n")
+    elif RunMode == 'InitStatistics':
+        base_log_dir = './logs/InitStatistics'
         for combo in combinations:
-            # Create a dictionary for the current parameter combination.
             param_config = dict(zip(keys, combo))
-            # Create a folder name that encodes the parameter values.
+            # Create one folder per configuration
             combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_Filt_{param_config['filtering_mode']}"
             combo_log_dir = os.path.join(base_log_dir, combo_folder)
             if not os.path.exists(combo_log_dir):
                 os.makedirs(combo_log_dir)
-            
-            sim_log_dir = os.path.join(combo_log_dir, f"Sample{sample_index}")
-            if not os.path.exists(sim_log_dir):
-                os.makedirs(sim_log_dir)
-            print(f"  Running simulation for parameter combination {param_config} ...")
-            run_simulation(sim_log_dir, device, sample_index, param_config)
-            print(f"  Simulation for parameter combination {param_config} completed.\n")
-        print(f"Completed all parameter combinations for simulation Sample {sample_index}\n")
-
+            # Call the new function to run n_experiments for this configuration
+            run_init_statistics(combo_log_dir, device, param_config, n_experiments=n_experiments)
+    else:
+        print("Invalid RunMode specified!")
 
 if __name__ == '__main__':
     main()
