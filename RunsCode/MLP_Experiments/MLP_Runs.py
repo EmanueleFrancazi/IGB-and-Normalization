@@ -6,7 +6,9 @@ import torch.optim as optim
 from torch.utils.data import TensorDataset, DataLoader
 import wandb  # make sure to install wandb (pip install wandb)
 import itertools
-
+from torch.utils.data import Subset
+import torchvision
+import torchvision.transforms as transforms
 
 # Print the process ID
 print(f"Process ID: {os.getpid()}")
@@ -44,6 +46,101 @@ def generate_gaussian_blobs(n_samples, dim, center_val, sigma2, device):
     Y = torch.cat([Y1, Y2], dim=0)
     perm = torch.randperm(X.size(0))
     return X[perm], Y[perm]
+
+def get_dataset_and_input_dim(param_config, device, train=True):
+    dataset_name = param_config.get("dataset", "Gaussian").lower()
+    offset_value = param_config.get("offset_value", 0.0)
+    
+    if dataset_name == "gaussian":
+        n_samples = 10000 if train else 500
+        input_dim = 1000
+        center_val = 1.0 / np.sqrt(input_dim)
+        sigma2 = 1.0
+        X, Y = generate_gaussian_blobs(n_samples, input_dim, center_val, sigma2, device)
+        dataset = TensorDataset(X, Y)
+    elif dataset_name == "mnist":
+        import torchvision
+        import torchvision.transforms as transforms
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.1307,), (0.3081,)),
+            transforms.Lambda(lambda x: x + offset_value),
+            transforms.Lambda(lambda x: x.view(-1))
+        ])
+        dataset = torchvision.datasets.MNIST(root='./data', train=train, download=True, transform=transform)
+        input_dim = 28 * 28
+    elif dataset_name == "cifar10":
+        import torchvision
+        import torchvision.transforms as transforms
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
+            transforms.Lambda(lambda x: x + offset_value),
+            transforms.Lambda(lambda x: x.view(-1))
+        ])
+        dataset = torchvision.datasets.CIFAR10(root='./data', train=train, download=True, transform=transform)
+        input_dim = 32 * 32 * 3
+    else:
+        raise ValueError(f"Dataset {dataset_name} not recognized!")
+        
+    # --- Apply class filtering/aggregation if specified ---
+    class_mapping = param_config.get("class_mapping", None)
+    if class_mapping is not None:
+        dataset = filter_dataset_by_class_mapping(dataset, class_mapping, remap=True)
+        
+    return dataset, input_dim
+
+
+def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True):
+    """
+    Filters a dataset based on a provided class_mapping dictionary.
+    
+    Args:
+      dataset: The dataset to filter (supports torchvision or TensorDataset).
+      class_mapping: A dict mapping original labels to new labels.
+      remap: If True, remap the labels as specified.
+      
+    Returns:
+      A new dataset with filtered and remapped labels.
+    """
+    if class_mapping is None:
+        return dataset  # No filtering
+    
+    filter_labels = set(class_mapping.keys())
+    indices = []
+    
+    # Retrieve labels from dataset (supporting both torchvision and TensorDataset)
+    if hasattr(dataset, 'targets'):
+        targets = dataset.targets
+        if isinstance(targets, list):
+            for i, label in enumerate(targets):
+                if label in filter_labels:
+                    indices.append(i)
+        else:
+            indices = (torch.stack([targets == c for c in filter_labels]).any(dim=0)).nonzero(as_tuple=True)[0].tolist()
+    elif hasattr(dataset, 'tensors'):
+        labels = dataset.tensors[1]
+        indices = (torch.stack([labels == c for c in filter_labels]).any(dim=0)).nonzero(as_tuple=True)[0].tolist()
+    else:
+        raise ValueError("Dataset type not supported for filtering.")
+    
+    subset = Subset(dataset, indices)
+    
+    if remap:
+        # Define a simple remapping dataset that applies the mapping on-the-fly.
+        class RemappedDataset(torch.utils.data.Dataset):
+            def __init__(self, subset, mapping):
+                self.subset = subset
+                self.mapping = mapping
+            def __getitem__(self, index):
+                data, label = self.subset[index]
+                return data, self.mapping[label]
+            def __len__(self):
+                return len(self.subset)
+        return RemappedDataset(subset, class_mapping)
+    else:
+        return subset
+
 
 #############################################
 # 2. MLP definition with normalization options
@@ -223,6 +320,15 @@ def log_metrics(log_dir, step, train_metrics, test_metrics):
     log_value(log_dir, 'test_class1_loss.txt', test_metrics[1]['loss'])
     log_value(log_dir, 'test_class1_accuracy.txt', test_metrics[1]['accuracy'])
 
+def log_ordered_metrics(log_dir, step, ordered_train_metrics, ordered_test_metrics):
+    log_value(log_dir, 'train_ordered_loss_class0.txt', ordered_train_metrics[0]['loss'])
+    log_value(log_dir, 'train_ordered_accuracy_class0.txt', ordered_train_metrics[0]['accuracy'])
+    log_value(log_dir, 'train_ordered_loss_class1.txt', ordered_train_metrics[1]['loss'])
+    log_value(log_dir, 'train_ordered_accuracy_class1.txt', ordered_train_metrics[1]['accuracy'])
+    log_value(log_dir, 'test_ordered_loss_class0.txt', ordered_test_metrics[0]['loss'])
+    log_value(log_dir, 'test_ordered_accuracy_class0.txt', ordered_test_metrics[0]['accuracy'])
+    log_value(log_dir, 'test_ordered_loss_class1.txt', ordered_test_metrics[1]['loss'])
+    log_value(log_dir, 'test_ordered_accuracy_class1.txt', ordered_test_metrics[1]['accuracy'])
 
 
 def label_map_function(frac0, frac1):
@@ -240,7 +346,7 @@ def label_map_function(frac0, frac1):
         return {0: 1, 1: 0}  # Swap nodes
 
 
-def OrderOutputNodes(model, label_map):
+def OrderOutputNodes(model, label_map): #NOTE: this function is currently not used in the code as the new solution is to keep track of the ordering and use the label_map_function to log both raw and ordered metrics.
     """
     Reorder the weights of the output nodes according to the provided label_map.
     """
@@ -262,25 +368,43 @@ def OrderOutputNodes(model, label_map):
 
 
 
-def get_normalized_weights(model):
+def get_normalized_parameters(model):
     """
-    Extract all weight parameters from the model (ignoring biases),
+    Extract all trainable parameters from the model (including weights and biases),
     flatten them into a single vector, and normalize the vector to have L2 norm = 1.
     
-    This returns the normalized weights vector.
+    Returns the normalized parameter vector.
     """
-    weight_list = []
-    for name, param in model.named_parameters():
-        if 'weight' in name:  # consider only parameters whose name includes 'weight'
-            weight_list.append(param.view(-1))
-    w = torch.cat(weight_list)
-    norm = torch.norm(w)
+    param_list = []
+    for param in model.parameters():
+        if param.requires_grad:
+            param_list.append(param.view(-1))
+    if not param_list:
+        return torch.tensor([])
+    p = torch.cat(param_list)
+    norm = torch.norm(p)
     if norm > 0:
-        return w / norm
+        return p / norm
     else:
-        return w
+        return p
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+#############################################
+# 6. Single simulation run (training + evaluation)
+#############################################
 #############################################
 # 6. Single simulation run (training + evaluation)
 #############################################
@@ -290,70 +414,81 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     All log files are written to sim_log_dir.
     Wandb is initialized for this experiment.
     
-    The simulation parameters (learning_rate, batch_size, num_hidden_layers)
+    The simulation parameters (learning_rate, batch_size, num_hidden_layers, dataset, offset_value)
     are passed in via the param_config dictionary.
     """
-    # === Simulation parameters ===
-    dim = 1000                      # number of components
-    center_val = 1.0 / np.sqrt(dim) #5 #1.0 / np.sqrt(dim) # centers: [1/sqrt(dim), ...] and [-1/sqrt(dim), ...]
-    sigma2 = 1.0   #0.1 #1.0                    # variance
-    n_samples_train = 10000
-    n_samples_test  = 500
-
+    # --- Extract dataset configuration ---
+    dataset_name = param_config.get("dataset", "Gaussian").lower()
+    offset_value = param_config.get("offset_value", 0.0)
+    
+    # --- Load dataset and determine input dimension ---
+    # get_dataset_and_input_dim should return a dataset and the input_dim.
+    # For Gaussian, it returns a TensorDataset; for MNIST/CIFAR10, a torchvision dataset.
+    train_dataset, input_dim = get_dataset_and_input_dim(param_config, device, train=True)
+    test_dataset, _ = get_dataset_and_input_dim(param_config, device, train=False)
+    
+    batch_size = param_config["batch_size"]
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    
+    # --- Compute dataset-specific metrics and prepare data for filtering ---
+    if dataset_name == "gaussian":
+        # For Gaussian blobs, use the provided parameters.
+        dim = input_dim  # e.g., 1000
+        center_val = 1.0 / np.sqrt(dim)
+        sigma2 = 1.0
+        center_positive = np.full((dim,), center_val)
+        center_negative = -np.full((dim,), center_val)
+        L2_distance = np.linalg.norm(center_positive - center_negative)
+        std_val = np.sqrt(sigma2)
+        BlobsSeparation = L2_distance / std_val
+        print(f"Blobs Separation (normalized): {BlobsSeparation}")
+        # Extract training tensor directly from the TensorDataset
+        train_X, _ = train_dataset.tensors
+    else:
+        # For MNIST/CIFAR10, we do not compute BlobsSeparation.
+        BlobsSeparation = None
+        print(f"Dataset: {param_config['dataset']}")
+        # For filtering check, stack a subset of samples (e.g., first 1000) into a tensor.
+        subset_size = min(1000, len(train_dataset))
+        train_X = torch.stack([train_dataset[i][0] for i in range(subset_size)]).to(device)
+    
+    # --- Model parameters ---
     num_hidden_layers = param_config["num_hidden_layers"]
-    hidden_dim = 100 #100
-    output_dim = 2
+    hidden_dim = 100
 
+    if dataset_name == "gaussian":
+        output_dim = 2
+    elif param_config.get("class_mapping", None) is not None:
+        # Use the number of unique new labels
+        output_dim = len(set(param_config["class_mapping"].values()))
+    else:
+        output_dim = 10  # default for full MNIST or CIFAR10
 
-    # === Compute Blobs Separation ===
-    # Define centers for two blobs: one positive and one negative
-    center_positive = np.full((dim,), center_val)
-    center_negative = -np.full((dim,), center_val)
-
-    # L2 distance between centers
-    L2_distance = np.linalg.norm(center_positive - center_negative)  # equals 2*center_val*sqrt(dim)
-
-    # Standard deviation from the variance sigma2
-    std_val = np.sqrt(sigma2)
-
-    # Normalized separation (BlobsSeparation)
-    BlobsSeparation = L2_distance / std_val
-    print(f"Blobs Separation (normalized): {BlobsSeparation}")
-
-
-
-
-    # Define the threshold mapping based on filtering mode
-    threshold_map = {
-        'low_igb': 0.1,
-        'high_igb': 0.9,
-        'none': None
-    }
-
-    # Set filtering mode
-    filtering_mode = param_config["filtering_mode"]  # options: 'high_igb', 'low_igb', or 'none'
-
-    # Retrieve the threshold value based on filtering mode
-    threshold = threshold_map.get(filtering_mode, None)  # Default to None if filtering_mode is invalid
-
-    print(f"Filtering mode: {filtering_mode}, Threshold: {threshold}")
-    max_attempts = 1000
-
-
-    num_epochs = 80 #15
-    num_eval_points = 15
-
-    # === Wandb initialization ===
-    #norm_config = param_config.get("norm_config", "bn_after")
+    # --- Wandb initialization ---
     norm_config = param_config.get("norm_config")
     learning_rate = param_config["learning_rate"]
-    batch_size = param_config["batch_size"]
-    group_name = f'NormMode_{norm_config}_depth_{num_hidden_layers}_lr_{learning_rate}_Bs_{batch_size}_Filtering_{filtering_mode}'
-    run_name   = f'Sample{sample_index}'
-    wandb_id   = wandb.util.generate_id()
-    tags = [f"LR_{learning_rate}", f"BS_{batch_size}", f"NormMode_{norm_config}", f"Depth_{num_hidden_layers}", f"NormMode_{norm_config}", f"Filtering_{filtering_mode}", f"BlobsSeparation_{BlobsSeparation:.2f}"]
+    filtering_mode = param_config["filtering_mode"]  # 'high_igb', 'low_igb', or 'none'
     
-    run = wandb.init(project=  'MLP_exp_G_Blobs_Final', #'MLP_exp_G_Blobs_FraSetting', #'MLP_exp_G_Blobs_New',
+    # Construct group name and tags including dataset and offset.
+    group_name = (f"dataset_{param_config['dataset']}_offset_{offset_value}_"
+                  f"NormMode_{norm_config}_depth_{num_hidden_layers}_"
+                  f"lr_{learning_rate}_Bs_{batch_size}_Filtering_{filtering_mode}")
+    run_name = f"Sample{sample_index}"
+    wandb_id = wandb.util.generate_id()
+    tags = [
+        f"dataset_{param_config['dataset']}",
+        f"offset_{offset_value}",
+        f"LR_{learning_rate}",
+        f"BS_{batch_size}",
+        f"NormMode_{norm_config}",
+        f"Depth_{num_hidden_layers}",
+        f"Filtering_{filtering_mode}"
+    ]
+    # Optionally, include BlobsSeparation tag if available.
+    if BlobsSeparation is not None:
+        tags.append(f"BlobsSeparation_{BlobsSeparation:.2f}")
+
+    run = wandb.init(project='MLP_exp_RealData_Macro_HP',
                      group=group_name,
                      name=run_name,
                      id=wandb_id,
@@ -367,14 +502,16 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     CustomizedX_Axis()
     
     wandb.config.update({
-      "learning_rate": learning_rate,
-      "epochs": num_epochs,
-      "batch_size": batch_size,
-      "norm_config": norm_config,
-      "num_hidden_layers": num_hidden_layers
+        "learning_rate": learning_rate,
+        "epochs": 200,
+        "batch_size": batch_size,
+        "norm_config": norm_config,
+        "num_hidden_layers": num_hidden_layers,
+        "dataset": param_config["dataset"],
+        "offset_value": offset_value
     })
     
-    # === Clear log files in sim_log_dir ===
+    # --- Clear log files in sim_log_dir ---
     files_to_clear = [
         'eval_times.txt',
         'train_global_loss.txt', 'train_global_accuracy.txt', 'train_frac0.txt', 'train_frac1.txt', 'train_max_frac.txt',
@@ -385,88 +522,73 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     for f in files_to_clear:
         open(os.path.join(sim_log_dir, f), 'w').close()
     
-    # === Data generation ===
-    train_X, train_Y = generate_gaussian_blobs(n_samples_train, dim, center_val, sigma2, device)
-    test_X, test_Y   = generate_gaussian_blobs(n_samples_test, dim, center_val, sigma2, device)
-    train_dataset = TensorDataset(train_X, train_Y)
-    test_dataset  = TensorDataset(test_X, test_Y)
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    
-    # === Model creation ===
-    model = MLP(input_dim=dim, hidden_dim=hidden_dim, num_hidden_layers=num_hidden_layers,
+    # --- Model creation ---
+    model = MLP(input_dim=input_dim, hidden_dim=hidden_dim, num_hidden_layers=num_hidden_layers,
                 output_dim=output_dim, norm_config=norm_config)
     model.to(device)
+    
+    # --- Filtering mode (if used) ---
+    # Define threshold values as before.
+    threshold_map = {
+        'low_igb': 0.1,
+        'high_igb': 0.9,
+        'none': None
+    }
+    threshold = threshold_map.get(filtering_mode, None)
+    print(f"Filtering mode: {filtering_mode}, Threshold: {threshold}")
+    max_attempts = 1000
 
-    # === Filtering mode (if used) ===
     if filtering_mode.lower() == 'high_igb':
-        counter = 0  # Initialize counter for iterations
+        counter = 0
         while True:
-            counter += 1  # Increment counter at the beginning of each iteration
-
-            # Check if maximum attempts have been reached
+            counter += 1
             if counter > max_attempts:
                 print(f"[Filtering mode High IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
                 wandb.finish()
-                return  # Exit from run_simulation
-
+                return
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff > threshold:
                 print(f"[Filtering mode High IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
             else:
-                #print(f"[Filtering mode High IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights. Iteration: {counter}")
                 model.init_weights()
     elif filtering_mode.lower() == 'low_igb':
-        counter = 0  # Initialize counter for iterations
+        counter = 0
         while True:
-            counter += 1  # Increment counter at the beginning of each iteration
-
-            # Check if maximum attempts have been reached
+            counter += 1
             if counter > max_attempts:
-                print(f"[Filtering mode High IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
+                print(f"[Filtering mode Low IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
                 wandb.finish()
-                return  # Exit from run_simulation
-
+                return
             diff, frac0, frac1 = filtering_check(model, train_X, device)
             if diff < threshold:
                 print(f"[Filtering mode Low IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
             else:
-                #print(f"[Filtering mode Low IGB] Condition NOT met (diff = {diff:.4f}); reinitializing weights. Iteration: {counter}")
                 model.init_weights()
-
     else:
         print("[Filtering mode] No filtering is performed.")
     
-
-    # === Ordering Output Nodes to Assign Majority Guesses to Node 0 ===
-
-    OrderingClassesFlag = 'ON'  # Set to 'ON' to enable swapping, 'OFF' to disable
-
-    # Evaluate initial fractions of guesses assigned to each class after initialization
+    # --- Ordering Output Nodes ---
+    OrderingClassesFlag = 'ON'
     if OrderingClassesFlag == 'ON':
         diff, frac0, frac1 = filtering_check(model, train_X, device)
-        print(f"Initial fractions before node ordering: frac0={frac0:.4f}, frac1={frac1:.4f}")
-
-        # Determine if reordering of output nodes is necessary
-        label_map = label_map_function(frac0, frac1)
-
-        # Apply the reordering
-        if label_map != {0: 0, 1: 1}:
-            print(f"Ordering output nodes as per label map: {label_map}")
-            OrderOutputNodes(model, label_map)
+        print(f"Initial fractions: class0 = {frac0:.4f}, class1 = {frac1:.4f}")
+        # For binary classification, simply rank the two classes:
+        if frac0 >= frac1:
+            ordered_mapping = {0: 0, 1: 1}  # class0 is majority
         else:
-            print("No ordering of output nodes needed (node 0 already assigned to majority guesses).")
+            ordered_mapping = {0: 1, 1: 0}  # class1 is majority, so we treat it as "ordered class 0"
+        print(f"Ordered mapping (ordered index -> original label): {ordered_mapping}")
     else:
-        print("OrderingClassesFlag is OFF. No ordering of output nodes performed.")
-
-
-
-
+        ordered_mapping = {0: 0, 1: 1}
+    # --- Training setup ---
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     criterion_train = nn.CrossEntropyLoss()
     criterion_eval  = nn.CrossEntropyLoss(reduction='none')
     
+    num_epochs = 200
+    num_eval_points = 15
     total_steps = num_epochs * len(train_loader)
     if total_steps > 8:
         eval_steps_log = np.unique(np.logspace(np.log10(9), np.log10(total_steps), num=num_eval_points - 8, dtype=int))
@@ -476,36 +598,37 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     eval_steps = np.unique(eval_steps).tolist()
     print("Evaluation will occur at steps:", eval_steps)
     
-    # Compute w0 by extracting all weight parameters, flattening, and normalizing.
-    w0 = get_normalized_weights(model).detach().cpu()
+    # Compute initial normalized weights
+    w0 = get_normalized_parameters(model).detach().cpu()
 
     step_counter = 0
     next_eval_idx = 0
     for epoch in range(num_epochs):
         for batch in train_loader:
-
             if next_eval_idx < len(eval_steps) and step_counter >= eval_steps[next_eval_idx]:
                 train_metrics = evaluate_dataset(model, train_dataset, criterion_eval, device,
                                                  set_type='train', eval_batch_size=128)
                 test_metrics  = evaluate_dataset(model, test_dataset, criterion_eval, device,
                                                  set_type='test', eval_batch_size=128)
-                
-                # Compute current normalized weights (wt) in the same way as w0.
-                wt = get_normalized_weights(model).detach().cpu()
-                # Compute the scalar product between w0 and wt.
+                ordered_train_metrics = {}
+                ordered_test_metrics = {}
+                for new_idx, orig_label in ordered_mapping.items():
+                    ordered_train_metrics[new_idx] = train_metrics[orig_label]
+                    ordered_test_metrics[new_idx] = test_metrics[orig_label] 
+
+                wt = get_normalized_parameters(model).detach().cpu()
                 dot_product = torch.dot(w0, wt).item()
                 print(f"Step {step_counter}: w0 · wt = {dot_product:.4f}")
-                # Append the dot product value with the current step to a log file.
                 with open(os.path.join(sim_log_dir, "w0_wt_dot.txt"), "a") as f:
                     f.write(f"{step_counter} {dot_product}\n")
-
-
                 print(f"Step {step_counter}: Train loss={train_metrics['global']['loss']:.4f}, " +
                       f"Train acc={train_metrics['global']['accuracy']:.4f} | " +
                       f"Test loss={test_metrics['global']['loss']:.4f}, Test acc={test_metrics['global']['accuracy']:.4f}")
-                # Log to files
+                # Log raw metrics.
                 log_metrics(sim_log_dir, step_counter, train_metrics, test_metrics)
-                # Log to wandb with per-class metrics included.
+                # Log ordered metrics.
+                log_ordered_metrics(sim_log_dir, step_counter, ordered_train_metrics, ordered_test_metrics)
+                # Log to wandb.
                 wandb.log({
                     'Performance_measures/Train_Accuracy': train_metrics['global']['accuracy'],
                     'Performance_measures/Train_Loss': train_metrics['global']['loss'],
@@ -523,6 +646,16 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                     'Performance_measures/Test_Accuracy_Class_0': test_metrics[0]['accuracy'],
                     'Performance_measures/Test_Loss_Class_1': test_metrics[1]['loss'],
                     'Performance_measures/Test_Accuracy_Class_1': test_metrics[1]['accuracy'],
+                    # Ordered metrics:
+                    'Performance_measures/Train_Accuracy_Ordered_Class_0': ordered_train_metrics[0]['accuracy'],
+                    'Performance_measures/Train_Loss_Ordered_Class_0': ordered_train_metrics[0]['loss'],
+                    'Performance_measures/Train_Accuracy_Ordered_Class_1': ordered_train_metrics[1]['accuracy'],
+                    'Performance_measures/Train_Loss_Ordered_Class_1': ordered_train_metrics[1]['loss'],
+                    'Performance_measures/Test_Accuracy_Ordered_Class_0': ordered_test_metrics[0]['accuracy'],
+                    'Performance_measures/Test_Loss_Ordered_Class_0': ordered_test_metrics[0]['loss'],
+                    'Performance_measures/Test_Accuracy_Ordered_Class_1': ordered_test_metrics[1]['accuracy'],
+                    'Performance_measures/Test_Loss_Ordered_Class_1': ordered_test_metrics[1]['loss'],
+
                     'w0_wt_dot': dot_product,
                     'Performance_measures/True_Steps_+_1': step_counter + 1,
                 })
@@ -544,27 +677,52 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     wandb.finish()
 
 
-
-
 def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000):
-    # Generate the training blob data once per configuration
-    n_samples_train = 10000
-    dim = 100
-    center_val = 1.0 / np.sqrt(dim)
-    sigma2 = 1.0
-    train_X, train_Y = generate_gaussian_blobs(n_samples_train, dim, center_val, sigma2, device)
-    train_dataset = TensorDataset(train_X, train_Y)
-
-    hidden_dim = 100
-    output_dim = 2
+    """
+    Run multiple independent initializations and log the initial frac0 values.
+    This version supports different datasets (Gaussian, MNIST, CIFAR10) with an added offset.
     
+    The param_config dictionary must include:
+      - "dataset": one of "Gaussian", "MNIST", "CIFAR10"
+      - "offset_value": a float value to add to the standardized images (for MNIST/CIFAR10)
+      - Other parameters like "num_hidden_layers" and "norm_config".
+    
+    All frac0 values for a given configuration are appended to a single file in combo_log_dir.
+    """
+    # --- Load the training dataset and determine the input dimension ---
+    # get_dataset_and_input_dim should return (dataset, input_dim)
+    train_dataset, input_dim = get_dataset_and_input_dim(param_config, device, train=True)
+    dataset_name = param_config.get("dataset", "Gaussian").lower()
+    
+    # --- Prepare training data for filtering ---
+    if dataset_name == "gaussian":
+        # For Gaussian, the dataset is a TensorDataset.
+        train_X, _ = train_dataset.tensors
+    else:
+        # For MNIST/CIFAR10, extract a subset of images and stack them into a single tensor.
+        subset_size = min(1000, len(train_dataset))
+        train_X = torch.stack([train_dataset[i][0] for i in range(subset_size)]).to(device)
+    
+    # --- Model parameters ---
+    hidden_dim = 100
+
+    if dataset_name == "gaussian":
+        output_dim = 2
+    elif param_config.get("class_mapping", None) is not None:
+        # Use the number of unique new labels
+        output_dim = len(set(param_config["class_mapping"].values()))
+    else:
+        output_dim = 10  # default for full MNIST or CIFAR10
+
+
     # Define file path for storing the frac0 values for this configuration
     log_file_path = os.path.join(combo_log_dir, 'init_frac0.txt')
     
     # For each independent initialization:
     for experiment in range(1, n_experiments + 1):
-        # Create the model using current param_config (no filtering loop here)
-        model = MLP(input_dim=dim, hidden_dim=hidden_dim, num_hidden_layers=param_config["num_hidden_layers"],
+        # Create the model using the given param_config.
+        model = MLP(input_dim=input_dim, hidden_dim=hidden_dim, 
+                    num_hidden_layers=param_config["num_hidden_layers"],
                     output_dim=output_dim, norm_config=param_config["norm_config"])
         model.to(device)
         
@@ -573,42 +731,43 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
         print(f"Experiment {experiment} for config {param_config}: Initial frac0 = {frac0:.4f}, frac1 = {frac1:.4f}")
         
         # Optionally perform ordering if desired
-        OrderingClassesFlag = 'ON'  # This flag can also come from param_config if needed
+        OrderingClassesFlag = 'ON'  # Alternatively, this flag could be set via param_config
         if OrderingClassesFlag == 'ON':
-            label_map = label_map_function(frac0, frac1)
-            if label_map != {0: 0, 1: 1}:
-                print(f"Ordering output nodes with label map: {label_map}")
-                OrderOutputNodes(model, label_map)
-                # Optionally recompute fractions after ordering:
-                diff, frac0, frac1 = filtering_check(model, train_X, device)
-        
-        # Append the frac0 value to the common log file for this configuration
-        with open(log_file_path, 'a') as f:
-            f.write(f"{frac0}\n")
-
+            diff, frac0, frac1 = filtering_check(model, train_X, device)
+            print(f"Initial fractions: class0 = {frac0:.4f}, class1 = {frac1:.4f}")
+            # For binary classification, simply rank the two classes:
+            if frac0 >= frac1:
+                ordered_mapping = {0: 0, 1: 1}  # class0 is majority
+            else:
+                ordered_mapping = {0: 1, 1: 0}  # class1 is majority, so we treat it as "ordered class 0"
+            print(f"Ordered mapping (ordered index -> original label): {ordered_mapping}")
+        else:
+            ordered_mapping = {0: 0, 1: 1}
 
 
 #############################################
 # 7. Main: Outer loop over simulation experiments with a parameter grid
 #############################################
 def main():
-    device_str =  'cuda:1'  #'cuda:0'  # or 'cpu'
+    device_str = 'cuda:1'  #'cuda:0'  # or 'cpu'
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
     
     # Set the RunMode flag:
-    RunMode = 'InitStatistics' #'Dynamics'  # or 'InitStatistics'
+    RunMode = 'Dynamics'  #'Dynamics'  # or 'InitStatistics'
 
     # Define a parameter grid for simulations.
     # To add/change parameters, simply modify this dictionary.
+
     param_grid = {
-        'dataset': ['Gaussian', 'MNIST', 'CIFAR10'],
-        'offset_value': [0.0, 1, 5],
-        'learning_rate': [0.00001], #[1e-4, 1e-3, 1e-2, 1e-1], #[1e-3],
-        'batch_size': [512],  #[64, 128, 256, 512], #[128], 
-        'num_hidden_layers': [1, 20], #[2, 15, 30],
-        'norm_config': ['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #[ 'bn_before', 'ln_before'], #['bn_after', 'bn_before', 'ln_after', 'ln_before'],  # can be 'bn_before', 'bn_after', 'ln_before', 'ln_after', 'none'
-        'filtering_mode': ['none'] # can be 'high_igb', 'low_igb', 'none'
-    }
+    'dataset': ['CIFAR10'], # 'Gaussian', 'MNIST', 'CIFAR10'
+    'offset_value': [0.0, 1, 5],
+    'learning_rate': [0.00001],
+    'batch_size': [512],
+    'num_hidden_layers': [1, 20],
+    'norm_config': ['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
+    'filtering_mode': ['high_igb', 'low_igb'],  # 'high_igb', 'low_igb', or 'none'
+    'class_mapping': [{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
+}
     
     # Use itertools.product to generate all parameter combinations.
     keys = list(param_grid.keys())
@@ -617,21 +776,22 @@ def main():
     n_experiments = 5000  # number of independent runs (samples)
 
     if RunMode == 'Dynamics':
-
         base_log_dir = './logs'
         if not os.path.exists(base_log_dir):
             os.makedirs(base_log_dir)
-        # For each parameter combination, create a subfolder and run n_experiments per combination.    
-
-        
-
+        # For each parameter combination, create a subfolder and run n_experiments per combination.
         for sample_index in range(1, n_experiments + 1):
             print(f"Starting simulation Sample {sample_index} for all parameter combinations...")
             for combo in combinations:
                 # Create a dictionary for the current parameter combination.
                 param_config = dict(zip(keys, combo))
-                # Create a folder name that encodes the parameter values.
-                combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_Filt_{param_config['filtering_mode']}"
+                # Create a folder name that encodes the parameter values, including dataset and offset.
+                combo_folder = (
+                    f"dataset_{param_config['dataset']}_offset_{param_config['offset_value']}_"
+                    f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_"
+                    f"depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_"
+                    f"Filt_{param_config['filtering_mode']}"
+                )
                 combo_log_dir = os.path.join(base_log_dir, combo_folder)
                 if not os.path.exists(combo_log_dir):
                     os.makedirs(combo_log_dir)
@@ -647,8 +807,13 @@ def main():
         base_log_dir = './logs/InitStatistics'
         for combo in combinations:
             param_config = dict(zip(keys, combo))
-            # Create one folder per configuration
-            combo_folder = f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_Filt_{param_config['filtering_mode']}"
+            # Create one folder per configuration that encodes dataset and offset
+            combo_folder = (
+                f"dataset_{param_config['dataset']}_offset_{param_config['offset_value']}_"
+                f"lr_{param_config['learning_rate']}_Bs_{param_config['batch_size']}_"
+                f"depth_{param_config['num_hidden_layers']}_norm_{param_config['norm_config']}_"
+                f"Filt_{param_config['filtering_mode']}"
+            )
             combo_log_dir = os.path.join(base_log_dir, combo_folder)
             if not os.path.exists(combo_log_dir):
                 os.makedirs(combo_log_dir)
