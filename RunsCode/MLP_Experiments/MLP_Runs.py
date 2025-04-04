@@ -10,6 +10,9 @@ from torch.utils.data import Subset
 import torchvision
 import torchvision.transforms as transforms
 
+
+import random
+
 # Print the process ID
 print(f"Process ID: {os.getpid()}")
 
@@ -50,6 +53,7 @@ def generate_gaussian_blobs(n_samples, dim, center_val, sigma2, device):
 def get_dataset_and_input_dim(param_config, device, train=True):
     dataset_name = param_config.get("dataset", "Gaussian").lower()
     offset_value = param_config.get("offset_value", 0.0)
+    n_per_class = param_config.get("n_per_class", None)
     
     if dataset_name == "gaussian":
         n_samples = 10000 if train else 500
@@ -59,8 +63,7 @@ def get_dataset_and_input_dim(param_config, device, train=True):
         X, Y = generate_gaussian_blobs(n_samples, input_dim, center_val, sigma2, device)
         dataset = TensorDataset(X, Y)
     elif dataset_name == "mnist":
-        import torchvision
-        import torchvision.transforms as transforms
+
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,)),
@@ -70,8 +73,7 @@ def get_dataset_and_input_dim(param_config, device, train=True):
         dataset = torchvision.datasets.MNIST(root='./data', train=train, download=True, transform=transform)
         input_dim = 28 * 28
     elif dataset_name == "cifar10":
-        import torchvision
-        import torchvision.transforms as transforms
+
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -86,28 +88,35 @@ def get_dataset_and_input_dim(param_config, device, train=True):
     # --- Apply class filtering/aggregation if specified ---
     class_mapping = param_config.get("class_mapping", None)
     if class_mapping is not None:
-        dataset = filter_dataset_by_class_mapping(dataset, class_mapping, remap=True)
+        dataset = filter_dataset_by_class_mapping(dataset, class_mapping, remap=True, n_per_class=n_per_class)
         
     return dataset, input_dim
 
 
-def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True):
+
+
+def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True, n_per_class=None):
     """
-    Filters a dataset based on a provided class_mapping dictionary.
+    Filters a dataset based on a provided class_mapping dictionary and subsamples each class.
     
     Args:
       dataset: The dataset to filter (supports torchvision or TensorDataset).
       class_mapping: A dict mapping original labels to new labels.
       remap: If True, remap the labels as specified.
+      n_per_class: Controls subsampling. It can be:
+          - None: Use all samples.
+          - int: Use at most n_per_class samples from each label (if available).
+          - dict: A mapping from each original label to the desired number of samples.
+          - 'min': Automatically select the minimum number of samples available across all specified classes.
       
     Returns:
-      A new dataset with filtered and remapped labels.
+      A new dataset with filtered, optionally remapped, and subsampled labels.
     """
     if class_mapping is None:
         return dataset  # No filtering
     
     filter_labels = set(class_mapping.keys())
-    indices = []
+    indices_by_label = {label: [] for label in filter_labels}
     
     # Retrieve labels from dataset (supporting both torchvision and TensorDataset)
     if hasattr(dataset, 'targets'):
@@ -115,25 +124,53 @@ def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True):
         if isinstance(targets, list):
             for i, label in enumerate(targets):
                 if label in filter_labels:
-                    indices.append(i)
+                    indices_by_label[label].append(i)
         else:
-            indices = (torch.stack([targets == c for c in filter_labels]).any(dim=0)).nonzero(as_tuple=True)[0].tolist()
+            for c in filter_labels:
+                idx = (targets == c).nonzero(as_tuple=True)[0].tolist()
+                indices_by_label[c] = idx
     elif hasattr(dataset, 'tensors'):
         labels = dataset.tensors[1]
-        indices = (torch.stack([labels == c for c in filter_labels]).any(dim=0)).nonzero(as_tuple=True)[0].tolist()
+        for c in filter_labels:
+            idx = (labels == c).nonzero(as_tuple=True)[0].tolist()
+            indices_by_label[c] = idx
     else:
         raise ValueError("Dataset type not supported for filtering.")
     
-    subset = Subset(dataset, indices)
+    # If the user wants an automated balance, compute the minimum count once.
+    if n_per_class == 'min':
+        min_count = min(len(idx) for idx in indices_by_label.values())
+    
+    selected_indices = []
+    for label, indices in indices_by_label.items():
+        # Determine number of samples to select for this label
+        if n_per_class is None:
+            n = len(indices)
+        elif isinstance(n_per_class, dict):
+            n = min(n_per_class.get(label, len(indices)), len(indices))
+        elif isinstance(n_per_class, int):
+            n = min(n_per_class, len(indices))
+        elif n_per_class == 'min':
+            n = min_count
+        else:
+            raise ValueError("Invalid value for n_per_class.", n_per_class)
+        
+        # Shuffle indices to ensure randomness then take the first n
+        #random.shuffle(indices)            # Uncomment if you want to shuffle the indices, i.e. having different samples each run.
+        selected_indices.extend(indices[:n])
+    
+    # Create a subset using the selected indices
+    subset = Subset(dataset, selected_indices)
     
     if remap:
-        # Define a simple remapping dataset that applies the mapping on-the-fly.
+        # Define a remapping dataset that applies the mapping on-the-fly.
         class RemappedDataset(torch.utils.data.Dataset):
             def __init__(self, subset, mapping):
                 self.subset = subset
                 self.mapping = mapping
             def __getitem__(self, index):
                 data, label = self.subset[index]
+                # Apply the remapping for the label
                 return data, self.mapping[label]
             def __len__(self):
                 return len(self.subset)
@@ -488,7 +525,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     if BlobsSeparation is not None:
         tags.append(f"BlobsSeparation_{BlobsSeparation:.2f}")
 
-    run = wandb.init(project='MLP_exp_RealData_Macro_HP',
+    run = wandb.init(project='MLP_exp_RealData_MNIST_Final',
                      group=group_name,
                      name=run_name,
                      id=wandb_id,
@@ -587,7 +624,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     criterion_train = nn.CrossEntropyLoss()
     criterion_eval  = nn.CrossEntropyLoss(reduction='none')
     
-    num_epochs = 200
+    num_epochs = 80
     num_eval_points = 15
     total_steps = num_epochs * len(train_loader)
     if total_steps > 8:
@@ -753,20 +790,21 @@ def main():
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
     
     # Set the RunMode flag:
-    RunMode = 'Dynamics'  #'Dynamics'  # or 'InitStatistics'
+    RunMode = 'InitStatistics'  #'Dynamics'  # or 'InitStatistics'
 
     # Define a parameter grid for simulations.
     # To add/change parameters, simply modify this dictionary.
 
     param_grid = {
     'dataset': ['CIFAR10'], # 'Gaussian', 'MNIST', 'CIFAR10'
-    'offset_value': [0.0, 1, 5],
+    'offset_value': [0.0, 1,  5],
     'learning_rate': [0.00001],
     'batch_size': [512],
     'num_hidden_layers': [1, 20],
-    'norm_config': ['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
+    'norm_config': ['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
     'filtering_mode': ['high_igb', 'low_igb'],  # 'high_igb', 'low_igb', or 'none'
-    'class_mapping': [{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
+    'class_mapping': [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
+    'n_per_class': [None],  # Number of samples per class to select (None for all); can be a None dict or int or 'min'
 }
     
     # Use itertools.product to generate all parameter combinations.
