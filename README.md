@@ -1,4 +1,4 @@
-# Algorithms
+# IGB-and-Normalization
 
 This repository contains code to reproduce experiments analyzing the effects of normalization layers on IGB (Initial Guessing Bias). The code structure is designed to ensure compatibility with external repositories/projects with minimal edits, allowing for the extension of experiments and the study of IGB across different projects.
 
