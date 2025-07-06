@@ -10,7 +10,8 @@ from . import aug_tv_transforms as transforms
 
 from .constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD, DEFAULT_CROP_PCT
 from .auto_augment import rand_augment_transform, augment_and_mix_transform, auto_augment_transform
-from .transforms import str_to_interp_mode, str_to_pil_interp, RandomResizedCropAndInterpolation, ToNumpy
+# Integration: added the class to add the offset on data tensor
+from .transforms import str_to_interp_mode, str_to_pil_interp, RandomResizedCropAndInterpolation, ToNumpy, AddConstant
 from .random_erasing import RandomErasing
 
 
@@ -20,6 +21,8 @@ def transforms_noaug_train(
         use_prefetcher=False,
         mean=IMAGENET_DEFAULT_MEAN,
         std=IMAGENET_DEFAULT_STD,
+        # Integration: added the variable to set the offset on data tensor
+        add_constant=0.0
 ):
     if interpolation == 'random':
         # random interpolation not supported with no-aug
@@ -32,11 +35,17 @@ def transforms_noaug_train(
         # prefetcher and collate will handle tensor conversion and norm
         tfl += [ToNumpy()]
     else:
+        # Integration: added the class to add the offset on data tensor
         tfl += [
             transforms.ToTensor(),
+        ]
+        if add_constant != 0.0:
+            tfl += [AddConstant(add_constant)]
+        tfl += [
             transforms.Normalize(
                 mean=torch.tensor(mean),
-                std=torch.tensor(std))
+                std=torch.tensor(std)
+            )
         ]
     return transforms.Compose(tfl)
 
@@ -58,6 +67,8 @@ def transforms_imagenet_train(
         re_count=1,
         re_num_splits=0,
         separate=False,
+        # Integration: added the variable to set the offset on data tensor
+        add_constant=0.0
 ):
     """
     If separate==True, the transforms are returned as a tuple of 3 separate transforms
@@ -111,11 +122,17 @@ def transforms_imagenet_train(
         # prefetcher and collate will handle tensor conversion and norm
         final_tfl += [ToNumpy()]
     else:
+        # Integration: added the class to add the offset on data tensor
         final_tfl += [
             transforms.ToTensor(),
+        ]
+        if add_constant != 0.0:
+            final_tfl += [AddConstant(add_constant)]
+        final_tfl += [
             transforms.Normalize(
                 mean=torch.tensor(mean),
-                std=torch.tensor(std))
+                std=torch.tensor(std)
+            )
         ]
         if re_prob > 0.:
             final_tfl.append(
@@ -184,7 +201,9 @@ def create_transform(
         re_num_splits=0,
         crop_pct=None,
         tf_preprocessing=False,
-        separate=False):
+        separate=False,
+        # Integration: added the variable to set the offset on data tensor
+        add_constant=0.0):
 
     if isinstance(input_size, (tuple, list)):
         img_size = input_size[-2:]
@@ -204,7 +223,9 @@ def create_transform(
                 interpolation=interpolation,
                 use_prefetcher=use_prefetcher,
                 mean=mean,
-                std=std)
+                std=std, 
+                # Integration: added the variable to set the offset on data tensor
+                add_constant=add_constant)
         elif is_training:
             transform = transforms_imagenet_train(
                 img_size,
@@ -222,7 +243,9 @@ def create_transform(
                 re_mode=re_mode,
                 re_count=re_count,
                 re_num_splits=re_num_splits,
-                separate=separate)
+                separate=separate, 
+                # Integration: added the variable to set the offset on data tensor
+                add_constant=add_constant)
         else:
             assert not separate, "Separate transforms not supported for validation preprocessing"
             transform = transforms_imagenet_eval(

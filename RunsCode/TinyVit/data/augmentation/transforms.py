@@ -35,6 +35,17 @@ class ToTensor:
         return torch.from_numpy(np_img).to(dtype=self.dtype)
 
 
+# Integration: adding a function to add a constant value to the tensor. It will be useful for the pre-processing and tune the amount of IGB.
+
+class AddConstant:
+    def __init__(self, value=0.0):
+        self.value = value
+
+    def __call__(self, tensor):
+        return tensor + self.value
+
+
+
 _pil_interpolation_to_str = {
     Image.NEAREST: 'nearest',
     Image.BILINEAR: 'bilinear',

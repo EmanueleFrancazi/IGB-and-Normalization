@@ -22,6 +22,9 @@ from .augmentation.dataset_wrapper import DatasetWrapper
 from .imagenet22k_dataset import IN22KDataset
 from .sampler import MyDistributedSampler
 
+# Integration: added the class to add the offset on data tensor
+from .augmentation.transforms import AddConstant
+
 try:
     from timm.data import TimmDatasetTar
 except ImportError:
@@ -180,6 +183,8 @@ def build_transform(is_train, config):
             interpolation=config.DATA.INTERPOLATION,
             mean=mean,
             std=std,
+            # Integration: added the variable to set the offset on data tensor
+            add_constant=config.DATA.ADD_CONSTANT,
         )
         if not resize_im:
             # replace RandomResizedCropAndInterpolation with

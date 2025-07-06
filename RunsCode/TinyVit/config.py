@@ -41,6 +41,10 @@ _C.DATA.FNAME_FORMAT = '{}.jpeg'
 _C.DATA.DEBUG = False
 
 
+#Integration:  Constant added to every pixel before normalization; if set on 0 nothing change, with values \neq 0, it can be used to tune the amount of IGB.
+_C.DATA.ADD_CONSTANT = 0.0
+
+
 # -----------------------------------------------------------------------------
 # Model settings
 # -----------------------------------------------------------------------------
