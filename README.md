@@ -59,7 +59,11 @@ The repository includes a `requirements.txt` file located in the root directory.
 pip install --upgrade -r requirements.txt
 ```
 
+The `datasets` library is required when experimenting with the Tiny ImageNet dataset. Install it via `pip install datasets`.
+
 ## Running the Code
+
+The provided loaders support MNIST, CIFAR10, CIFAR100, and Tiny ImageNet.
 
 Depending on the type of experiment you want to perform, there are two main approaches:
 
