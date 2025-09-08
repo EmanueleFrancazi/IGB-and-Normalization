@@ -1,3 +1,5 @@
+# Updated script with minimal fixes applied
+
 import os
 import numpy as np
 import torch
@@ -11,6 +13,7 @@ import torchvision
 print('torchvision version', torchvision.__version__, flush=True)
 import torchvision.transforms as transforms
 
+from collections import defaultdict  # <-- FIX 1 (import)
 
 from utils.IGB_utils import *
 
@@ -311,7 +314,7 @@ def get_dataset_and_input_dim(param_config, device, train=True):
             transforms.Lambda(lambda x: x + offset_value),
             #transforms.Lambda(lambda x: x.view(-1))  # Remove for ViT!
         ])
-        hf_dataset = load_dataset("zh-plus/tiny-imagenet") # from https://huggingface.co/datasets/zh-plus/tiny-imagenet (other datasets in https://huggingface.co/datasets?sort=trending&search=imagenet)
+        hf_dataset = load_dataset("zh-plus/tiny-imagenet") # from https://huggingface.co/datasets/zh-plus/tiny-imagenet
         split = "train" if train else "valid"
         dataset = TinyImageNetDataset(hf_dataset[split], transform=transform)
         input_dim = 64 * 64 * 3
@@ -378,475 +381,7 @@ def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True):
         return subset
 
 
-#############################################
-# Swin Transformer definition
-#############################################
-import math
-import torch
-import torch.nn as nn
-import numpy as np
-from einops import rearrange
-from einops.layers.torch import Rearrange, Reduce
 
-try:
-    from timm.models.layers import trunc_normal_, DropPath
-except Exception:
-    from torch.nn.init import trunc_normal_
-    class DropPath(nn.Module):
-        def __init__(self, drop_prob=0.):
-            super().__init__()
-            self.drop_prob = drop_prob
-        def forward(self, x):
-            return x
-
-try:
-    from thop import profile  # optional; used only if available
-except Exception:
-    profile = None
-
-class WMSA(nn.Module):
-    """ Self-attention module in Swin Transformer
-    """
-
-    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
-        super(WMSA, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.head_dim = head_dim 
-        self.scale = self.head_dim ** -0.5
-        self.n_heads = input_dim//head_dim
-        self.window_size = window_size
-        self.type=type
-        self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
-
-        # TODO recover
-        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
-        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
-
-        self.linear = nn.Linear(self.input_dim, self.output_dim)
-
-        trunc_normal_(self.relative_position_params, std=.02)
-        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
-
-    def generate_mask(self, w, p, shift):
-        """ generating the mask of SW-MSA
-        Args:
-            shift: shift parameters in CyclicShift.
-        Returns:
-            attn_mask: should be (1 1 w p p),
-        """
-        # supporting sqaure.
-        attn_mask = torch.zeros(w, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
-        if self.type == 'W':
-            return attn_mask
-
-        s = p - shift
-        attn_mask[-1, :, :s, :, s:, :] = True
-        attn_mask[-1, :, s:, :, :s, :] = True
-        attn_mask[:, -1, :, :s, :, s:] = True
-        attn_mask[:, -1, :, s:, :, :s] = True
-        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
-        return attn_mask
-
-    def forward(self, x):
-        """ Forward pass of Window Multi-head Self-attention module.
-        Args:
-            x: input tensor with shape of [b h w c];
-            attn_mask: attention mask, fill -inf where the value is True; 
-        Returns:
-            output: tensor shape [b h w c]
-        """
-        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
-        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
-        h_windows = x.size(1)
-        w_windows = x.size(2)
-        # sqaure validation
-        assert h_windows == w_windows
-
-        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
-        qkv = self.embedding_layer(x)
-        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
-        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
-        # Adding learnable relative embedding
-        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
-        # Using Attn Mask to distinguish different subwindows.
-        if self.type != 'W':
-            attn_mask = self.generate_mask(h_windows, self.window_size, shift=self.window_size//2)
-            sim = sim.masked_fill_(attn_mask, float("-inf"))
-
-        probs = nn.functional.softmax(sim, dim=-1)
-        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
-        output = rearrange(output, 'h b w p c -> b w p (h c)')
-        output = self.linear(output)
-        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
-
-        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
-        return output
-    
-    def relative_embedding(self):
-        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
-        # negative is allowed
-        return self.relative_position_params[:, relation[:,:,0], relation[:,:,1]]
-
-class Block(nn.Module):
-    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None, norm_config='ln_before'):
-        """ SwinTransformer Block
-        """
-        super(Block, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        assert type in ['W', 'SW']
-        self.type = type
-        if input_resolution <= window_size:
-            self.type = 'W'
-
-        print("Block Initial Type: {}, drop_path_rate:{:.6f}".format(self.type, drop_path))
-        self.ln1 = nn.LayerNorm(input_dim)
-        self.msa = WMSA(input_dim, input_dim, head_dim, window_size, self.type)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.ln2 = nn.LayerNorm(input_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 4 * input_dim),
-            nn.GELU(),
-            nn.Linear(4 * input_dim, output_dim),
-        )
-        self.norm_config = norm_config or 'ln_before'
-
-    def forward(self, x):
-        if self.norm_config == 'ln_before':
-            x = x + self.drop_path(self.msa(self.ln1(x)))
-            x = x + self.drop_path(self.mlp(self.ln2(x)))
-            return x
-        elif self.norm_config == 'ln_after':
-            x = x + self.drop_path(self.msa(x))
-            x = self.ln1(x)
-            x = x + self.drop_path(self.mlp(x))
-            x = self.ln2(x)
-            return x
-        else:
-            raise ValueError("SwinTransformer supports norm_config 'ln_before' or 'ln_after' only.")
-
-class SwinTransformer(nn.Module):
-    """ Implementation of Swin Transformer https://arxiv.org/abs/2103.14030
-    In this Implementation, the standard shape of data is (b h w c), which is a similar protocal as cnn.
-    """
-    #TODO make layers using configs
-    def __init__(self, num_classes, config=[2,2,6,2], dim=96, drop_path_rate=0.2, input_resolution=224, norm_config='ln_before'):
-        super(SwinTransformer, self).__init__()
-        self.config = config
-        self.dim = dim
-        self.head_dim = 32
-        self.window_size = 7
-        # self.patch_partition = Rearrange('b c (h1 sub_h) (w1 sub_w) -> b h1 w1 (c sub_h sub_w)', sub_h=4, sub_w=4)
-
-        self.norm_config = norm_config or 'ln_before'
-
-        # drop path rate for each layer
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
-
-        begin = 0
-        self.stage1 = [nn.Conv2d(3, dim, kernel_size=4, stride=4),
-                       Rearrange('b c h w -> b h w c'),
-                       nn.LayerNorm(dim),] + \
-                      [Block(dim, dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//4, norm_config=self.norm_config) 
-                      for i in range(config[0])]
-        begin += config[0]
-        self.stage2 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(4*dim), nn.Linear(4*dim, 2*dim, bias=False),] + \
-                      [Block(2*dim, 2*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//8, norm_config=self.norm_config)
-                      for i in range(config[1])]
-        begin += config[1]
-        self.stage3 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(8*dim), nn.Linear(8*dim, 4*dim, bias=False),] + \
-                      [Block(4*dim, 4*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW',input_resolution//16, norm_config=self.norm_config)
-                      for i in range(config[2])]
-        begin += config[2]
-        self.stage4 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(16*dim), nn.Linear(16*dim, 8*dim, bias=False),] + \
-                      [Block(8*dim, 8*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//32, norm_config=self.norm_config)
-                      for i in range(config[3])]
-        
-        self.stage1 = nn.Sequential(*self.stage1)
-        self.stage2 = nn.Sequential(*self.stage2)
-        self.stage3 = nn.Sequential(*self.stage3)
-        self.stage4 = nn.Sequential(*self.stage4)
-
-        self.norm_last = nn.LayerNorm(dim * 8)
-        self.mean_pool = Reduce('b h w c -> b c', reduction='mean')
-        self.classifier = nn.Linear(8*dim, num_classes) if num_classes > 0 else nn.Identity()
-
-        self.init_weights()
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def init_weights(self):
-        self.apply(self._init_weights)
-
-    def forward(self, x):
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        x = self.norm_last(x)
-
-        x = self.mean_pool(x)
-        x = self.classifier(x)
-        return x
-
-def Swin_T(num_classes, config=[2,2,6,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_S(num_classes, config=[2,2,18,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_B(num_classes, config=[2,2,18,2], dim=128, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_L(num_classes, config=[2,2,18,2], dim=192, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-#############################################
-# Swin Transformer definition
-#############################################
-import math
-import torch
-import torch.nn as nn
-import numpy as np
-from einops import rearrange
-from einops.layers.torch import Rearrange, Reduce
-
-try:
-    from timm.models.layers import trunc_normal_, DropPath
-except Exception:
-    from torch.nn.init import trunc_normal_
-    class DropPath(nn.Module):
-        def __init__(self, drop_prob=0.):
-            super().__init__()
-            self.drop_prob = drop_prob
-        def forward(self, x):
-            return x
-
-try:
-    from thop import profile  # optional; used only if available
-except Exception:
-    profile = None
-
-class WMSA(nn.Module):
-    """ Self-attention module in Swin Transformer
-    """
-
-    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
-        super(WMSA, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        self.head_dim = head_dim 
-        self.scale = self.head_dim ** -0.5
-        self.n_heads = input_dim//head_dim
-        self.window_size = window_size
-        self.type=type
-        self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
-
-        # TODO recover
-        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
-        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
-
-        self.linear = nn.Linear(self.input_dim, self.output_dim)
-
-        trunc_normal_(self.relative_position_params, std=.02)
-        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
-
-    def generate_mask(self, w, p, shift):
-        """ generating the mask of SW-MSA
-        Args:
-            shift: shift parameters in CyclicShift.
-        Returns:
-            attn_mask: should be (1 1 w p p),
-        """
-        # supporting sqaure.
-        attn_mask = torch.zeros(w, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
-        if self.type == 'W':
-            return attn_mask
-
-        s = p - shift
-        attn_mask[-1, :, :s, :, s:, :] = True
-        attn_mask[-1, :, s:, :, :s, :] = True
-        attn_mask[:, -1, :, :s, :, s:] = True
-        attn_mask[:, -1, :, s:, :, :s] = True
-        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
-        return attn_mask
-
-    def forward(self, x):
-        """ Forward pass of Window Multi-head Self-attention module.
-        Args:
-            x: input tensor with shape of [b h w c];
-            attn_mask: attention mask, fill -inf where the value is True; 
-        Returns:
-            output: tensor shape [b h w c]
-        """
-        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
-        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
-        h_windows = x.size(1)
-        w_windows = x.size(2)
-        # sqaure validation
-        assert h_windows == w_windows
-
-        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
-        qkv = self.embedding_layer(x)
-        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
-        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
-        # Adding learnable relative embedding
-        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
-        # Using Attn Mask to distinguish different subwindows.
-        if self.type != 'W':
-            attn_mask = self.generate_mask(h_windows, self.window_size, shift=self.window_size//2)
-            sim = sim.masked_fill_(attn_mask, float("-inf"))
-
-        probs = nn.functional.softmax(sim, dim=-1)
-        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
-        output = rearrange(output, 'h b w p c -> b w p (h c)')
-        output = self.linear(output)
-        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
-
-        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
-        return output
-    
-    def relative_embedding(self):
-        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
-        # negative is allowed
-        return self.relative_position_params[:, relation[:,:,0], relation[:,:,1]]
-
-class Block(nn.Module):
-    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None, norm_config='ln_before'):
-        """ SwinTransformer Block
-        """
-        super(Block, self).__init__()
-        self.input_dim = input_dim
-        self.output_dim = output_dim
-        assert type in ['W', 'SW']
-        self.type = type
-        if input_resolution <= window_size:
-            self.type = 'W'
-
-        print("Block Initial Type: {}, drop_path_rate:{:.6f}".format(self.type, drop_path))
-        self.ln1 = nn.LayerNorm(input_dim)
-        self.msa = WMSA(input_dim, input_dim, head_dim, window_size, self.type)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.ln2 = nn.LayerNorm(input_dim)
-        self.mlp = nn.Sequential(
-            nn.Linear(input_dim, 4 * input_dim),
-            nn.GELU(),
-            nn.Linear(4 * input_dim, output_dim),
-        )
-        self.norm_config = norm_config or 'ln_before'
-
-    def forward(self, x):
-        if self.norm_config == 'ln_before':
-            x = x + self.drop_path(self.msa(self.ln1(x)))
-            x = x + self.drop_path(self.mlp(self.ln2(x)))
-            return x
-        elif self.norm_config == 'ln_after':
-            x = x + self.drop_path(self.msa(x))
-            x = self.ln1(x)
-            x = x + self.drop_path(self.mlp(x))
-            x = self.ln2(x)
-            return x
-        else:
-            raise ValueError("SwinTransformer supports norm_config 'ln_before' or 'ln_after' only.")
-
-class SwinTransformer(nn.Module):
-    """ Implementation of Swin Transformer https://arxiv.org/abs/2103.14030
-    In this Implementation, the standard shape of data is (b h w c), which is a similar protocal as cnn.
-    """
-    #TODO make layers using configs
-    def __init__(self, num_classes, config=[2,2,6,2], dim=96, drop_path_rate=0.2, input_resolution=224, norm_config='ln_before'):
-        super(SwinTransformer, self).__init__()
-        self.config = config
-        self.dim = dim
-        self.head_dim = 32
-        self.window_size = 7
-        # self.patch_partition = Rearrange('b c (h1 sub_h) (w1 sub_w) -> b h1 w1 (c sub_h sub_w)', sub_h=4, sub_w=4)
-
-        self.norm_config = norm_config or 'ln_before'
-
-        # drop path rate for each layer
-        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
-
-        begin = 0
-        self.stage1 = [nn.Conv2d(3, dim, kernel_size=4, stride=4),
-                       Rearrange('b c h w -> b h w c'),
-                       nn.LayerNorm(dim),] + \
-                      [Block(dim, dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//4, norm_config=self.norm_config) 
-                      for i in range(config[0])]
-        begin += config[0]
-        self.stage2 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(4*dim), nn.Linear(4*dim, 2*dim, bias=False),] + \
-                      [Block(2*dim, 2*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//8, norm_config=self.norm_config)
-                      for i in range(config[1])]
-        begin += config[1]
-        self.stage3 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(8*dim), nn.Linear(8*dim, 4*dim, bias=False),] + \
-                      [Block(4*dim, 4*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW',input_resolution//16, norm_config=self.norm_config)
-                      for i in range(config[2])]
-        begin += config[2]
-        self.stage4 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
-                       nn.LayerNorm(16*dim), nn.Linear(16*dim, 8*dim, bias=False),] + \
-                      [Block(8*dim, 8*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//32, norm_config=self.norm_config)
-                      for i in range(config[3])]
-        
-        self.stage1 = nn.Sequential(*self.stage1)
-        self.stage2 = nn.Sequential(*self.stage2)
-        self.stage3 = nn.Sequential(*self.stage3)
-        self.stage4 = nn.Sequential(*self.stage4)
-
-        self.norm_last = nn.LayerNorm(dim * 8)
-        self.mean_pool = Reduce('b h w c -> b c', reduction='mean')
-        self.classifier = nn.Linear(8*dim, num_classes) if num_classes > 0 else nn.Identity()
-
-        self.init_weights()
-
-    def _init_weights(self, m):
-        if isinstance(m, nn.Linear):
-            trunc_normal_(m.weight, std=.02)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.LayerNorm):
-            nn.init.constant_(m.bias, 0)
-            nn.init.constant_(m.weight, 1.0)
-
-    def init_weights(self):
-        self.apply(self._init_weights)
-
-    def forward(self, x):
-        x = self.stage1(x)
-        x = self.stage2(x)
-        x = self.stage3(x)
-        x = self.stage4(x)
-        x = self.norm_last(x)
-
-        x = self.mean_pool(x)
-        x = self.classifier(x)
-        return x
-
-def Swin_T(num_classes, config=[2,2,6,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_S(num_classes, config=[2,2,18,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_B(num_classes, config=[2,2,18,2], dim=128, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
-
-def Swin_L(num_classes, config=[2,2,18,2], dim=192, input_resolution=224, norm_config='ln_before', **kwargs):
-    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
 
 #############################################
 # 3. Filtering mode: check initial imbalance
@@ -1076,6 +611,287 @@ def get_normalized_parameters(model):
 
 
 #%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% MODELS
+
+
+
+
+
+#############################################
+# Swin Transformer definition
+#############################################
+import math
+import torch
+import torch.nn as nn
+import numpy as np
+from einops import rearrange
+from einops.layers.torch import Rearrange, Reduce
+
+try:
+    from timm.models.layers import trunc_normal_, DropPath
+except Exception:
+    from torch.nn.init import trunc_normal_
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob=0.):
+            super().__init__()
+            self.drop_prob = drop_prob
+        def forward(self, x):
+            return x
+
+try:
+    from thop import profile  # optional; used only if available
+except Exception:
+    profile = None
+
+class WMSA(nn.Module):
+    """ Self-attention module in Swin Transformer
+    """
+
+    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
+        super(WMSA, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.head_dim = head_dim 
+        self.scale = self.head_dim ** -0.5
+        self.n_heads = input_dim//head_dim
+        self.window_size = window_size
+        self.type=type
+        self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
+
+        # TODO recover
+        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
+        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
+
+        self.linear = nn.Linear(self.input_dim, self.output_dim)
+
+        trunc_normal_(self.relative_position_params, std=.02)
+        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
+
+    def generate_mask(self, w, p, shift):
+        """ generating the mask of SW-MSA
+        Args:
+            shift: shift parameters in CyclicShift.
+        Returns:
+            attn_mask: should be (1 1 w p p),
+        """
+        # supporting sqaure.
+        attn_mask = torch.zeros(w, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        if self.type == 'W':
+            return attn_mask
+
+        s = p - shift
+        attn_mask[-1, :, :s, :, s:, :] = True
+        attn_mask[-1, :, s:, :, :s, :] = True
+        attn_mask[:, -1, :, :s, :, s:] = True
+        attn_mask[:, -1, :, s:, :, :s] = True
+        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        return attn_mask
+
+    def forward(self, x):
+        """ Forward pass of Window Multi-head Self-attention module.
+        Args:
+            x: input tensor with shape of [b h w c];
+            attn_mask: attention mask, fill -inf where the value is True; 
+        Returns:
+            output: tensor shape [b h w c]
+        """
+        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
+        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
+        h_windows = x.size(1)
+        w_windows = x.size(2)
+        # sqaure validation
+        assert h_windows == w_windows
+
+        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+        qkv = self.embedding_layer(x)
+        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
+        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
+        # Adding learnable relative embedding
+        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
+        # Using Attn Mask to distinguish different subwindows.
+        if self.type != 'W':
+            attn_mask = self.generate_mask(h_windows, self.window_size, shift=self.window_size//2)
+            sim = sim.masked_fill_(attn_mask, float("-inf"))
+
+        probs = nn.functional.softmax(sim, dim=-1)
+        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
+        output = rearrange(output, 'h b w p c -> b w p (h c)')
+        output = self.linear(output)
+        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
+
+        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
+        return output
+    
+    def relative_embedding(self):
+        cord = torch.tensor(
+            [[i, j] for i in range(self.window_size) for j in range(self.window_size)],
+            device=self.relative_position_params.device
+        )
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
+        return self.relative_position_params[:, relation[:, :, 0], relation[:, :, 1]]
+
+
+
+
+class SwinBlock(nn.Module):  # <-- FIX 3 (rename from Block -> SwinBlock)
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None, norm_config='ln_before'):
+        """ SwinTransformer Block
+        """
+        super(SwinBlock, self).__init__()  # <-- FIX 3 (updated super)
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        assert type in ['W', 'SW']
+        self.type = type
+        if input_resolution <= window_size:
+            self.type = 'W'
+
+        print("Block Initial Type: {}, drop_path_rate:{:.6f}".format(self.type, drop_path))
+        self.ln1 = nn.LayerNorm(input_dim)
+        self.msa = WMSA(input_dim, input_dim, head_dim, window_size, self.type)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.ln2 = nn.LayerNorm(input_dim)
+
+        # conditional LayerNorm(4 * input_dim) inserted after GELU when ln_after
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 4 * input_dim),
+            nn.GELU(),
+            nn.LayerNorm(4 * input_dim) if (norm_config or 'ln_before') == 'ln_after' else nn.Identity(),
+            nn.Linear(4 * input_dim, output_dim),
+        )
+
+        self.norm_config = norm_config or 'ln_before'
+
+    def forward(self, x):
+        if self.norm_config == 'ln_before':
+            x = x + self.drop_path(self.msa(self.ln1(x)))
+            x = x + self.drop_path(self.mlp(self.ln2(x)))
+            return x
+        elif self.norm_config == 'ln_after':
+            x = x + self.drop_path(self.msa(x))
+            x = self.ln1(x)
+            x = x + self.drop_path(self.mlp(x))
+            x = self.ln2(x)
+            return x
+        else:
+            raise ValueError("SwinTransformer supports norm_config 'ln_before' or 'ln_after' only.")
+
+class SwinTransformer(nn.Module):
+    """ Implementation of Swin Transformer https://arxiv.org/abs/2103.14030
+    In this Implementation, the standard shape of data is (b h w c), which is a similar protocal as cnn.
+    """
+    # TODO make layers using configs
+    def __init__(self, num_classes, config=[2,2,6,2], dim=96, drop_path_rate=0.2, input_resolution=224, norm_config='ln_before'):
+        super(SwinTransformer, self).__init__()
+        self.config = config
+        self.dim = dim
+
+        self.head_dim = 32
+        # Choose a window size that tiles all stages and equals the last stage spatial size
+        # Stages are: input/4, input/8, input/16, input/32. Using window_size = input/32
+        # guarantees divisibility at every stage: (×8, ×4, ×2, ×1).
+        self.window_size = max(1, input_resolution // 32)
+
+        # Optional: helpful sanity print for debugging
+        print(f"[Swin] input_resolution={input_resolution} -> window_size={self.window_size}", flush=True)
+        # self.patch_partition = Rearrange('b c (h1 sub_h) (w1 sub_w) -> b h1 w1 (c sub_h sub_w)', sub_h=4, sub_w=4)
+
+        # Best-effort early check: stage shapes should be divisible by window_size
+        _stage1 = input_resolution // 4
+        for s in (_stage1, _stage1 // 2, _stage1 // 4, _stage1 // 8):
+            if s % self.window_size != 0:
+                raise ValueError(
+                    f"Swin window_size={self.window_size} does not tile stage size {s}. "
+                    f"Use input_resolution divisible by 32 (e.g., 64, 96, 128, 224) or adjust window_size logic."
+                )
+
+        self.norm_config = norm_config or 'ln_before'
+
+        # drop path rate for each layer
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
+
+        begin = 0
+        self.stage1 = [nn.Conv2d(3, dim, kernel_size=4, stride=4),
+                       Rearrange('b c h w -> b h w c'),
+                       nn.LayerNorm(dim),] + \
+                      [SwinBlock(dim, dim, self.head_dim, self.window_size, dpr[i+begin],
+                                 'W' if not i % 2 else 'SW', input_resolution // 4, norm_config=self.norm_config)
+                       for i in range(config[0])]
+        begin += config[0]
+
+        self.stage2 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2),
+                       nn.LayerNorm(4 * dim), nn.Linear(4 * dim, 2 * dim, bias=False),] + \
+                      [SwinBlock(2 * dim, 2 * dim, self.head_dim, self.window_size, dpr[i+begin],
+                                 'W' if not i % 2 else 'SW', input_resolution // 8, norm_config=self.norm_config)
+                       for i in range(config[1])]
+        begin += config[1]
+
+        self.stage3 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2),
+                       nn.LayerNorm(8 * dim), nn.Linear(8 * dim, 4 * dim, bias=False),] + \
+                      [SwinBlock(4 * dim, 4 * dim, self.head_dim, self.window_size, dpr[i+begin],
+                                 'W' if not i % 2 else 'SW', input_resolution // 16, norm_config=self.norm_config)
+                       for i in range(config[2])]
+        begin += config[2]
+
+        self.stage4 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2),
+                       nn.LayerNorm(16 * dim), nn.Linear(16 * dim, 8 * dim, bias=False),] + \
+                      [SwinBlock(8 * dim, 8 * dim, self.head_dim, self.window_size, dpr[i+begin],
+                                 'W' if not i % 2 else 'SW', input_resolution // 32, norm_config=self.norm_config)
+                       for i in range(config[3])]
+
+        self.stage1 = nn.Sequential(*self.stage1)
+        self.stage2 = nn.Sequential(*self.stage2)
+        self.stage3 = nn.Sequential(*self.stage3)
+        self.stage4 = nn.Sequential(*self.stage4)
+
+        self.norm_last = nn.LayerNorm(dim * 8)
+        self.mean_pool = Reduce('b h w c -> b c', reduction='mean')
+        self.classifier = nn.Linear(8 * dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        self.init_weights()
+
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.norm_last(x)
+
+        x = self.mean_pool(x)
+        x = self.classifier(x)
+        return x
+
+def Swin_T(num_classes, config=[2,2,6,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_S(num_classes, config=[2,2,18,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_B(num_classes, config=[2,2,18,2], dim=128, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_L(num_classes, config=[2,2,18,2], dim=192, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+
+
+
+
+
+
+
+
 
 #############################################
 # 2. MLP definition with normalization options
@@ -1471,8 +1287,6 @@ class ViTForClassfication(ImageClassificationBase):
     def forward(self, x, output_attentions=False):
         outs = {}
         
-
-        
         # Calculate the embedding output
         embedding_output = self.embedding(x)
         # Calculate the encoder's output
@@ -1480,25 +1294,10 @@ class ViTForClassfication(ImageClassificationBase):
         # Calculate the logits, take the [CLS] token's output as features for classification
         logits = self.output(encoder_output[:, 0, :])
         # Return the logits and the attention probabilities (optional)
-                
-        """
-        if not output_attentions:
-            return (logits, None)
-        else:
-            return (logits, all_attentions)
-    
-        """
         outs['l2'] = encoder_output[:, 0, :]
-
         outs['out'] = logits
-        #outs['pred'] = torch.argmax(logits, dim=1)
-        #return outs
         return outs['out']
         
-        
-    
-    
-    
     def initialize_weights(self, module):
         if isinstance(module, (nn.Linear, nn.Conv2d)):
             #torch.nn.init.normal_(module.weight, mean=0.0, std=self.config["initializer_range"])
@@ -1641,6 +1440,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     # --- Extract dataset configuration ---
     dataset_name = param_config.get("dataset", "Gaussian").lower()
     offset_value = param_config.get("offset_value", 0.0)
+    model_name = param_config.get('model', 'MLP')  # <-- FIX 5 (define model_name)
     
     # --- Load dataset and determine input dimension ---
     # get_dataset_and_input_dim should return a dataset and the input_dim.
@@ -1680,8 +1480,6 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     train_classes = per_class_counting(train_dataset)
 
     num_classes = len(train_classes)
-
-
 
     if dataset_name == "gaussian":
         output_dim = 2
@@ -1776,31 +1574,27 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
             norm_config=norm_config
         )
 
-
     elif param_config['model'] == 'ViT':
-
         # Auto-get image size/channels for config
         sample_img, _ = train_dataset[0]
         input_channels = sample_img.shape[0]
         input_image_size = sample_img.shape[1]  # assumes square; use shape[1], shape[2] if not
 
-
         config = {
-    "patch_size": 4,
-    "hidden_size": 48,
-    "num_hidden_layers": 4,
-    "num_attention_heads": 4,
-    "intermediate_size": 4 * 48,
-    "hidden_dropout_prob": 0.0,
-    "attention_probs_dropout_prob": 0.0,
-    "initializer_range": 0.02,
-    "image_size": input_image_size,    # <-- Automatically set!
-    "num_classes": num_classes,
-    "num_channels": input_channels,    # <-- Automatically set!
-    "qkv_bias": False,
-}
+            "patch_size": 4,
+            "hidden_size": 48,
+            "num_hidden_layers": 4,
+            "num_attention_heads": 4,
+            "intermediate_size": 4 * 48,
+            "hidden_dropout_prob": 0.0,
+            "attention_probs_dropout_prob": 0.0,
+            "initializer_range": 0.02,
+            "image_size": input_image_size,    # <-- Automatically set!
+            "num_classes": num_classes,
+            "num_channels": input_channels,    # <-- Automatically set!
+            "qkv_bias": False,
+        }
         model = ViTForClassfication(config, param_config)
-
 
     elif param_config['model'] == 'ResNet101':
         model = ResNet101v2(param_config, num_classes=output_dim)
@@ -1992,7 +1786,6 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
 
     num_classes = len(train_classes)
 
-
     if dataset_name == "gaussian":
         output_dim = 2
     elif param_config.get("class_mapping", None) is not None:
@@ -2000,7 +1793,6 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
         output_dim = len(set(param_config["class_mapping"].values()))
     else:
         output_dim = num_classes  # default for full MNIST or CIFAR10
-
 
     # Define file path for storing the frac0 values for this configuration
     log_file_path = os.path.join(combo_log_dir, 'init_frac0.txt')
@@ -2030,8 +1822,6 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
             ctor = {'Swin_T': Swin_T, 'Swin_S': Swin_S, 'Swin_B': Swin_B, 'Swin_L': Swin_L}[model_name]
             model = ctor(num_classes=output_dim, input_resolution=input_resolution, drop_path_rate=0.2, norm_config=norm_config)
 
-
-
         elif param_config['model'] == 'ViT':
 
             # Auto-get image size/channels for config
@@ -2040,21 +1830,20 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
             input_image_size = sample_img.shape[1]  # assumes square; use shape[1], shape[2] if not
 
             config = {
-        "patch_size": 4,
-        "hidden_size": 48,
-        "num_hidden_layers": 4,
-        "num_attention_heads": 4,
-        "intermediate_size": 4 * 48,
-        "hidden_dropout_prob": 0.0,
-        "attention_probs_dropout_prob": 0.0,
-        "initializer_range": 0.02,
-        "image_size": input_image_size,    # <-- Automatically set!
-        "num_classes": num_classes,
-        "num_channels": input_channels,    # <-- Automatically set!
-        "qkv_bias": False,
-    }
+                "patch_size": 4,
+                "hidden_size": 48,
+                "num_hidden_layers": 4,
+                "num_attention_heads": 4,
+                "intermediate_size": 4 * 48,
+                "hidden_dropout_prob": 0.0,
+                "attention_probs_dropout_prob": 0.0,
+                "initializer_range": 0.02,
+                "image_size": input_image_size,    # <-- Automatically set!
+                "num_classes": num_classes,
+                "num_channels": input_channels,    # <-- Automatically set!
+                "qkv_bias": False,
+            }
             model = ViTForClassfication(config, param_config)
-
 
         elif param_config['model'] == 'ResNet101':
             model = ResNet101v2(param_config, num_classes=output_dim)
@@ -2064,32 +1853,23 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
         
         # Compute initial fractions without any reinitialization loop
         diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
-        #print(f"Experiment {experiment} for config {param_config}: Initial frac0 = {frac0:.4f}, frac1 = {frac1:.4f}")
-        # Optionally perform ordering if desired
-        OrderingClassesFlag = 'OFF'  # Alternatively, this flag could be set via param_config
+        OrderingClassesFlag = 'OFF'
         if OrderingClassesFlag == 'ON':
             diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
-            #print(f"Initial fractions: class0 = {frac0:.4f}, class1 = {frac1:.4f}")
-            # For binary classification, simply rank the two classes:
             if frac0 >= frac1:
-                # Append the frac0 value to the common log file for this configuration
                 with open(log_file_path, 'a') as f:
                     f.write(f"{frac0}\n")
             else:
-                # Append the frac0 value to the common log file for this configuration
                 with open(log_file_path, 'a') as f:
                     f.write(f"{frac1}\n")
         else:
             ordered_mapping = {0: 0, 1: 1}
-            # Append the frac0 value to the common log file for this configuration
             with open(log_file_path, 'a') as f:
                 f.write(f"{frac0}\n")
 
-            # Append the max fraction to its log file
             with open(log_file_maxf, 'a') as f:
                 f.write(f"{max_fraction}\n")
 
-            # Append the full vector of class fractions (space-separated) to its log file
             with open(log_file_vector, 'a') as f:
                 f.write(" ".join([f"{frac:.8f}" for frac in class_fractions]) + "\n")
 
@@ -2102,7 +1882,7 @@ def main():
     device_str = 'cuda:1'  #'cuda:0'  # or 'cpu'
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
 
-    ModelFlag = 'ResNet101'  #'MLP'  # or 'ViT'  # or 'ResNet101'
+    ModelFlag = 'Swin_L'  #'MLP'  # or 'ViT'  # or 'ResNet101' or 'Swin_T','Swin_S','Swin_B','Swin_L'
     
     # Set the RunMode flag:
     RunMode = 'InitStatistics'  #'Dynamics'  # or 'InitStatistics'
@@ -2111,23 +1891,23 @@ def main():
     # To add/change parameters, simply modify this dictionary.
 
     param_grid = {
-    'dataset': ['tinyimagenet'], # 'Gaussian', 'MNIST', 'CIFAR10'
-    'offset_value': [0.0],
-    'learning_rate': [0.00001],
-    'batch_size': [512],
-    'num_hidden_layers': [1],#[1, 20],
-    'norm_config': ['bn_before','bn_after'], #['bn_before','bn_after'], #['none', 'ln_before','ln_after'], #['bn_before'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
-    'filtering_mode': ['none'],  # 'high_igb', 'low_igb', or 'none'
-    'class_mapping': [None], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}], #[{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
-    'n_per_class': ['min'],  # Number of samples per class to select (None for all); can be a None dict or int or 'min'
-    'model': [ModelFlag],  # 'MLP', 'ViT', or 'ResNet101'
-}
+        'dataset': ['tinyimagenet'], # 'Gaussian', 'MNIST', 'CIFAR10'
+        'offset_value': [0.0],
+        'learning_rate': [0.00001],
+        'batch_size': [512],
+        'num_hidden_layers': [1],#[1, 20],
+        'norm_config': ['ln_before','ln_after'],
+        'filtering_mode': ['none'],  # 'high_igb', 'low_igb', or 'none'
+        'class_mapping': [None],
+        'n_per_class': ['min'],  # Number of samples per class to select (None for all); can be a None dict or int or 'min'
+        'model': [ModelFlag],  # 'MLP', 'ViT', or 'ResNet101'
+    }
     
     # Use itertools.product to generate all parameter combinations.
     keys = list(param_grid.keys())
     combinations = list(itertools.product(*(param_grid[key] for key in keys)))
 
-    n_experiments = 10000 #10#5000  # number of independent runs (samples)
+    n_experiments = 10000 # number of independent runs (samples)
 
     if RunMode == 'Dynamics':
         base_log_dir = './logs'
@@ -2178,6 +1958,7 @@ def main():
 
 if __name__ == '__main__':
     main()
+
 
 
 
