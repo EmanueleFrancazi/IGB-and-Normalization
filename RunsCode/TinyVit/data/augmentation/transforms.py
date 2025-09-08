@@ -38,11 +38,17 @@ class ToTensor:
 # Integration: adding a function to add a constant value to the tensor. It will be useful for the pre-processing and tune the amount of IGB.
 
 class AddConstant:
-    def __init__(self, value=0.0):
+    """Add a scalar constant to a tensor or numpy array."""
+
+    def __init__(self, value: float = 0.0):
         self.value = value
 
     def __call__(self, tensor):
-        return tensor + self.value
+        if isinstance(tensor, torch.Tensor):
+            return tensor + self.value
+        if isinstance(tensor, np.ndarray):
+            return tensor + self.value
+        raise TypeError(f"Unsupported input type {type(tensor)}")
 
 
 
