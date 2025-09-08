@@ -12,7 +12,14 @@ print('torchvision version', torchvision.__version__, flush=True)
 import torchvision.transforms as transforms
 
 
+from utils.IGB_utils import *
+
 import random
+
+from datasets import load_dataset
+from torch.utils.data import Dataset
+
+import torchvision.transforms as transforms
 
 # Print the process ID
 print(f"Process ID: {os.getpid()}")
@@ -52,6 +59,42 @@ def generate_gaussian_blobs(n_samples, dim, center_val, sigma2, device):
     return X[perm], Y[perm]
 
 
+
+class TinyImageNetDataset(Dataset):
+    def __init__(self, hf_dataset, transform=None):
+        self.hf_dataset = hf_dataset
+        self.transform = transform
+        # This line creates a .targets attribute as a list of int labels
+        self.targets = [item['label'] for item in hf_dataset]
+
+    def __getitem__(self, idx):
+        img = self.hf_dataset[idx]['image']
+        label = self.hf_dataset[idx]['label']
+        if self.transform:
+            img = self.transform(img)
+        return img, label
+
+    def __len__(self):
+        return len(self.hf_dataset)
+
+
+
+def per_class_counting(dataset):
+
+    class_counts = defaultdict(int)
+    
+    if isinstance(dataset.targets, list):
+        # If targets are in list format
+        for label in dataset.targets:
+            class_counts[label] += 1
+    elif isinstance(dataset.targets, torch.Tensor):
+        # If targets are in tensor format
+        for label in dataset.targets.tolist():
+            class_counts[label] += 1
+    else:
+        raise ValueError("Unsupported data type for targets. Must be a list or a torch.Tensor.")
+    
+    return class_counts
 
 """
 # this version allow to select the number of datapoints for each label: need to debug
@@ -238,8 +281,6 @@ def get_dataset_and_input_dim(param_config, device, train=True):
         X, Y = generate_gaussian_blobs(n_samples, input_dim, center_val, sigma2, device)
         dataset = TensorDataset(X, Y)
     elif dataset_name == "mnist":
-        import torchvision
-        import torchvision.transforms as transforms
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.1307,), (0.3081,)),
@@ -249,8 +290,6 @@ def get_dataset_and_input_dim(param_config, device, train=True):
         dataset = torchvision.datasets.MNIST(root='./data', train=train, download=True, transform=transform)
         input_dim = 28 * 28
     elif dataset_name == "cifar10":
-        import torchvision
-        import torchvision.transforms as transforms
         transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize((0.4914, 0.4822, 0.4465), (0.2023, 0.1994, 0.2010)),
@@ -259,6 +298,24 @@ def get_dataset_and_input_dim(param_config, device, train=True):
         ])
         dataset = torchvision.datasets.CIFAR10(root='./data', train=train, download=True, transform=transform)
         input_dim = 32 * 32 * 3
+
+    elif dataset_name == "tinyimagenet":
+        from datasets import load_dataset
+        transform = transforms.Compose([
+            transforms.Resize((64, 64)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            ),
+            transforms.Lambda(lambda x: x + offset_value),
+            #transforms.Lambda(lambda x: x.view(-1))  # Remove for ViT!
+        ])
+        hf_dataset = load_dataset("zh-plus/tiny-imagenet") # from https://huggingface.co/datasets/zh-plus/tiny-imagenet (other datasets in https://huggingface.co/datasets?sort=trending&search=imagenet)
+        split = "train" if train else "valid"
+        dataset = TinyImageNetDataset(hf_dataset[split], transform=transform)
+        input_dim = 64 * 64 * 3
+
     else:
         raise ValueError(f"Dataset {dataset_name} not recognized!")
         
@@ -320,53 +377,241 @@ def filter_dataset_by_class_mapping(dataset, class_mapping, remap=True):
     else:
         return subset
 
-#############################################
-# 2. MLP definition with normalization options
-#############################################
-class MLP(nn.Module):
-    def __init__(self, input_dim, hidden_dim, num_hidden_layers, output_dim, norm_config):
-        """
-        norm_config must be one of:
-         - 'bn_before': BatchNorm1d before ReLU
-         - 'bn_after':  BatchNorm1d after ReLU
-         - 'ln_before': LayerNorm before ReLU
-         - 'ln_after':  LayerNorm after ReLU
-        """
-        super(MLP, self).__init__()
-        layers = []
-        current_dim = input_dim
-        for _ in range(num_hidden_layers):
-            layers.append(nn.Linear(current_dim, hidden_dim))
-            if norm_config.lower() == 'bn_before':
-                layers.append(nn.BatchNorm1d(hidden_dim))
-                layers.append(nn.ReLU())
-            elif norm_config.lower() == 'bn_after':
-                layers.append(nn.ReLU())
-                layers.append(nn.BatchNorm1d(hidden_dim))
-            elif norm_config.lower() == 'ln_before':
-                layers.append(nn.LayerNorm(hidden_dim))
-                layers.append(nn.ReLU())
-            elif norm_config.lower() == 'ln_after':
-                layers.append(nn.ReLU())
-                layers.append(nn.LayerNorm(hidden_dim))
-            else:
-                layers.append(nn.ReLU())
-            current_dim = hidden_dim
-        self.hidden = nn.Sequential(*layers)
-        self.output_layer = nn.Linear(current_dim, output_dim)
-        self.init_weights()
 
-    def init_weights(self):
-        """Initialize all linear layers with Kaiming normal and biases with zeros."""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
+#############################################
+# Swin Transformer definition
+#############################################
+import math
+import torch
+import torch.nn as nn
+import numpy as np
+from einops import rearrange
+from einops.layers.torch import Rearrange, Reduce
+
+try:
+    from timm.models.layers import trunc_normal_, DropPath
+except Exception:
+    from torch.nn.init import trunc_normal_
+    class DropPath(nn.Module):
+        def __init__(self, drop_prob=0.):
+            super().__init__()
+            self.drop_prob = drop_prob
+        def forward(self, x):
+            return x
+
+try:
+    from thop import profile  # optional; used only if available
+except Exception:
+    profile = None
+
+class WMSA(nn.Module):
+    """ Self-attention module in Swin Transformer
+    """
+
+    def __init__(self, input_dim, output_dim, head_dim, window_size, type):
+        super(WMSA, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        self.head_dim = head_dim 
+        self.scale = self.head_dim ** -0.5
+        self.n_heads = input_dim//head_dim
+        self.window_size = window_size
+        self.type=type
+        self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
+
+        # TODO recover
+        # self.relative_position_params = nn.Parameter(torch.zeros(self.n_heads, 2 * window_size - 1, 2 * window_size -1))
+        self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
+
+        self.linear = nn.Linear(self.input_dim, self.output_dim)
+
+        trunc_normal_(self.relative_position_params, std=.02)
+        self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
+
+    def generate_mask(self, w, p, shift):
+        """ generating the mask of SW-MSA
+        Args:
+            shift: shift parameters in CyclicShift.
+        Returns:
+            attn_mask: should be (1 1 w p p),
+        """
+        # supporting sqaure.
+        attn_mask = torch.zeros(w, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        if self.type == 'W':
+            return attn_mask
+
+        s = p - shift
+        attn_mask[-1, :, :s, :, s:, :] = True
+        attn_mask[-1, :, s:, :, :s, :] = True
+        attn_mask[:, -1, :, :s, :, s:] = True
+        attn_mask[:, -1, :, s:, :, :s] = True
+        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        return attn_mask
 
     def forward(self, x):
-        x = self.hidden(x)
-        return self.output_layer(x)
+        """ Forward pass of Window Multi-head Self-attention module.
+        Args:
+            x: input tensor with shape of [b h w c];
+            attn_mask: attention mask, fill -inf where the value is True; 
+        Returns:
+            output: tensor shape [b h w c]
+        """
+        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
+        x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
+        h_windows = x.size(1)
+        w_windows = x.size(2)
+        # sqaure validation
+        assert h_windows == w_windows
+
+        x = rearrange(x, 'b w1 w2 p1 p2 c -> b (w1 w2) (p1 p2) c', p1=self.window_size, p2=self.window_size)
+        qkv = self.embedding_layer(x)
+        q, k, v = rearrange(qkv, 'b nw np (threeh c) -> threeh b nw np c', c=self.head_dim).chunk(3, dim=0)
+        sim = torch.einsum('hbwpc,hbwqc->hbwpq', q, k) * self.scale
+        # Adding learnable relative embedding
+        sim = sim + rearrange(self.relative_embedding(), 'h p q -> h 1 1 p q')
+        # Using Attn Mask to distinguish different subwindows.
+        if self.type != 'W':
+            attn_mask = self.generate_mask(h_windows, self.window_size, shift=self.window_size//2)
+            sim = sim.masked_fill_(attn_mask, float("-inf"))
+
+        probs = nn.functional.softmax(sim, dim=-1)
+        output = torch.einsum('hbwij,hbwjc->hbwic', probs, v)
+        output = rearrange(output, 'h b w p c -> b w p (h c)')
+        output = self.linear(output)
+        output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
+
+        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
+        return output
+    
+    def relative_embedding(self):
+        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
+        # negative is allowed
+        return self.relative_position_params[:, relation[:,:,0], relation[:,:,1]]
+
+class Block(nn.Module):
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None, norm_config='ln_before'):
+        """ SwinTransformer Block
+        """
+        super(Block, self).__init__()
+        self.input_dim = input_dim
+        self.output_dim = output_dim
+        assert type in ['W', 'SW']
+        self.type = type
+        if input_resolution <= window_size:
+            self.type = 'W'
+
+        print("Block Initial Type: {}, drop_path_rate:{:.6f}".format(self.type, drop_path))
+        self.ln1 = nn.LayerNorm(input_dim)
+        self.msa = WMSA(input_dim, input_dim, head_dim, window_size, self.type)
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
+        self.ln2 = nn.LayerNorm(input_dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, 4 * input_dim),
+            nn.GELU(),
+            nn.Linear(4 * input_dim, output_dim),
+        )
+        self.norm_config = norm_config or 'ln_before'
+
+    def forward(self, x):
+        if self.norm_config == 'ln_before':
+            x = x + self.drop_path(self.msa(self.ln1(x)))
+            x = x + self.drop_path(self.mlp(self.ln2(x)))
+            return x
+        elif self.norm_config == 'ln_after':
+            x = x + self.drop_path(self.msa(x))
+            x = self.ln1(x)
+            x = x + self.drop_path(self.mlp(x))
+            x = self.ln2(x)
+            return x
+        else:
+            raise ValueError("SwinTransformer supports norm_config 'ln_before' or 'ln_after' only.")
+
+class SwinTransformer(nn.Module):
+    """ Implementation of Swin Transformer https://arxiv.org/abs/2103.14030
+    In this Implementation, the standard shape of data is (b h w c), which is a similar protocal as cnn.
+    """
+    #TODO make layers using configs
+    def __init__(self, num_classes, config=[2,2,6,2], dim=96, drop_path_rate=0.2, input_resolution=224, norm_config='ln_before'):
+        super(SwinTransformer, self).__init__()
+        self.config = config
+        self.dim = dim
+        self.head_dim = 32
+        self.window_size = 7
+        # self.patch_partition = Rearrange('b c (h1 sub_h) (w1 sub_w) -> b h1 w1 (c sub_h sub_w)', sub_h=4, sub_w=4)
+
+        self.norm_config = norm_config or 'ln_before'
+
+        # drop path rate for each layer
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
+
+        begin = 0
+        self.stage1 = [nn.Conv2d(3, dim, kernel_size=4, stride=4),
+                       Rearrange('b c h w -> b h w c'),
+                       nn.LayerNorm(dim),] + \
+                      [Block(dim, dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//4, norm_config=self.norm_config) 
+                      for i in range(config[0])]
+        begin += config[0]
+        self.stage2 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
+                       nn.LayerNorm(4*dim), nn.Linear(4*dim, 2*dim, bias=False),] + \
+                      [Block(2*dim, 2*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//8, norm_config=self.norm_config)
+                      for i in range(config[1])]
+        begin += config[1]
+        self.stage3 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
+                       nn.LayerNorm(8*dim), nn.Linear(8*dim, 4*dim, bias=False),] + \
+                      [Block(4*dim, 4*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW',input_resolution//16, norm_config=self.norm_config)
+                      for i in range(config[2])]
+        begin += config[2]
+        self.stage4 = [Rearrange('b (h neih) (w neiw) c -> b h w (neiw neih c)', neih=2, neiw=2), 
+                       nn.LayerNorm(16*dim), nn.Linear(16*dim, 8*dim, bias=False),] + \
+                      [Block(8*dim, 8*dim, self.head_dim, self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW', input_resolution//32, norm_config=self.norm_config)
+                      for i in range(config[3])]
+        
+        self.stage1 = nn.Sequential(*self.stage1)
+        self.stage2 = nn.Sequential(*self.stage2)
+        self.stage3 = nn.Sequential(*self.stage3)
+        self.stage4 = nn.Sequential(*self.stage4)
+
+        self.norm_last = nn.LayerNorm(dim * 8)
+        self.mean_pool = Reduce('b h w c -> b c', reduction='mean')
+        self.classifier = nn.Linear(8*dim, num_classes) if num_classes > 0 else nn.Identity()
+
+        self.init_weights()
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            trunc_normal_(m.weight, std=.02)
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.bias, 0)
+            nn.init.constant_(m.weight, 1.0)
+
+    def init_weights(self):
+        self.apply(self._init_weights)
+
+    def forward(self, x):
+        x = self.stage1(x)
+        x = self.stage2(x)
+        x = self.stage3(x)
+        x = self.stage4(x)
+        x = self.norm_last(x)
+
+        x = self.mean_pool(x)
+        x = self.classifier(x)
+        return x
+
+def Swin_T(num_classes, config=[2,2,6,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_S(num_classes, config=[2,2,18,2], dim=96, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_B(num_classes, config=[2,2,18,2], dim=128, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
+
+def Swin_L(num_classes, config=[2,2,18,2], dim=192, input_resolution=224, norm_config='ln_before', **kwargs):
+    return SwinTransformer(num_classes, config=config, dim=dim, input_resolution=input_resolution, norm_config=norm_config, **kwargs)
 
 #############################################
 # Swin Transformer definition
@@ -609,17 +854,31 @@ def Swin_L(num_classes, config=[2,2,18,2], dim=192, input_resolution=224, norm_c
 def filtering_check(model, data, device):
     """
     Run a forward pass (without gradients) on the dataset and compute the fraction
-    of datapoints predicted as class 0 and class 1.
-    Returns the absolute difference and the fractions.
+    of datapoints predicted as each class.
+    Returns:
+        diff: absolute difference between most and least guessed class fractions
+        frac0: fraction of datapoints predicted as class 0
+        frac1: fraction of datapoints predicted as class 1 (if exists, else None)
+        class_fractions: list of fractions for all classes
+        max_fraction: maximum among class fractions
     """
-    # Note: you might want to set model.eval() externally if needed.
     with torch.no_grad():
         outputs = model(data)
         preds = outputs.argmax(dim=1)
-        frac0 = (preds == 0).float().mean().item()
-        frac1 = (preds == 1).float().mean().item()
+        num_classes = int(outputs.shape[1])
+        class_fractions = []
+        total = preds.numel()
+        for cls in range(num_classes):
+            frac = (preds == cls).float().mean().item()
+            class_fractions.append(frac)
+        max_fraction = max(class_fractions)
+        min_fraction = min(class_fractions)
+        # For backward compatibility
+        frac0 = class_fractions[0]
+        frac1 = class_fractions[1] if num_classes > 1 else None
         diff = abs(frac0 - frac1)
-    return diff, frac0, frac1
+
+    return diff, frac0, frac1, class_fractions, max_fraction
 
 #############################################
 # 4. Evaluation: compute loss and accuracy (global and per class)
@@ -815,6 +1074,555 @@ def get_normalized_parameters(model):
 
 
 
+
+#%%%%%%%%%%%%%%%%%%%%%%%%%%%%%% MODELS
+
+#############################################
+# 2. MLP definition with normalization options
+#############################################
+class MLP(nn.Module):
+    def __init__(self, input_dim, hidden_dim, num_hidden_layers, output_dim, norm_config):
+        """
+        norm_config must be one of:
+         - 'bn_before': BatchNorm1d before ReLU
+         - 'bn_after':  BatchNorm1d after ReLU
+         - 'ln_before': LayerNorm before ReLU
+         - 'ln_after':  LayerNorm after ReLU
+        """
+        super(MLP, self).__init__()
+        layers = []
+        current_dim = input_dim
+        for _ in range(num_hidden_layers):
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            if norm_config.lower() == 'bn_before':
+                layers.append(nn.BatchNorm1d(hidden_dim))
+                layers.append(nn.ReLU())
+            elif norm_config.lower() == 'bn_after':
+                layers.append(nn.ReLU())
+                layers.append(nn.BatchNorm1d(hidden_dim))
+            elif norm_config.lower() == 'ln_before':
+                layers.append(nn.LayerNorm(hidden_dim))
+                layers.append(nn.ReLU())
+            elif norm_config.lower() == 'ln_after':
+                layers.append(nn.ReLU())
+                layers.append(nn.LayerNorm(hidden_dim))
+            else:
+                layers.append(nn.ReLU())
+            current_dim = hidden_dim
+        self.hidden = nn.Sequential(*layers)
+        self.output_layer = nn.Linear(current_dim, output_dim)
+        self.init_weights()
+
+    def init_weights(self):
+        """Initialize all linear layers with Kaiming normal and biases with zeros."""
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        x = self.hidden(x)
+        return self.output_layer(x)
+    
+
+
+#############################################
+# 2. ViT definition with normalization options
+#############################################
+
+
+
+#%%% TRENSFORMER (ViT) (from https://github.com/tintn/vision-transformer-from-scratch/blob/main/vit.py)
+
+
+
+
+class NewGELUActivation(nn.Module):
+    """
+    Implementation of the GELU activation function currently in Google BERT repo (identical to OpenAI GPT). Also see
+    the Gaussian Error Linear Units paper: https://arxiv.org/abs/1606.08415
+
+    Taken from https://github.com/huggingface/transformers/blob/main/src/transformers/activations.py
+    """
+
+    def forward(self, input):
+        return 0.5 * input * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (input + 0.044715 * torch.pow(input, 3.0))))
+
+
+class PatchEmbeddings(nn.Module):
+    """
+    Convert the image into patches and then project them into a vector space.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.image_size = config["image_size"]
+        self.patch_size = config["patch_size"]
+        self.num_channels = config["num_channels"]
+        self.hidden_size = config["hidden_size"]
+        # Calculate the number of patches from the image size and patch size
+        self.num_patches = (self.image_size // self.patch_size) ** 2
+        # Create a projection layer to convert the image into patches
+        # The layer projects each patch into a vector of size hidden_size
+        self.projection = nn.Conv2d(self.num_channels, self.hidden_size, kernel_size=self.patch_size, stride=self.patch_size)
+
+    def forward(self, x):
+        # (batch_size, num_channels, image_size, image_size) -> (batch_size, num_patches, hidden_size)
+        x = self.projection(x)
+        x = x.flatten(2).transpose(1, 2)
+        return x
+
+
+class Embeddings(nn.Module):
+    """
+    Combine the patch embeddings with the class token and position embeddings.
+    """
+        
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.patch_embeddings = PatchEmbeddings(config)
+        # Create a learnable [CLS] token
+        # Similar to BERT, the [CLS] token is added to the beginning of the input sequence
+        # and is used to classify the entire sequence
+        self.cls_token = nn.Parameter(torch.randn(1, 1, config["hidden_size"]))
+        # Create position embeddings for the [CLS] token and the patch embeddings
+        # Add 1 to the sequence length for the [CLS] token
+        self.position_embeddings = \
+            nn.Parameter(torch.randn(1, self.patch_embeddings.num_patches + 1, config["hidden_size"]))
+        self.dropout = nn.Dropout(config["hidden_dropout_prob"])
+
+    def forward(self, x):
+        x = self.patch_embeddings(x)
+        batch_size, _, _ = x.size()
+        # Expand the [CLS] token to the batch size
+        # (1, 1, hidden_size) -> (batch_size, 1, hidden_size)
+        cls_tokens = self.cls_token.expand(batch_size, -1, -1)
+        # Concatenate the [CLS] token to the beginning of the input sequence
+        # This results in a sequence length of (num_patches + 1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = x + self.position_embeddings
+        x = self.dropout(x)
+        return x
+
+
+class AttentionHead(nn.Module):
+    """
+    A single attention head.
+    This module is used in the MultiHeadAttention module.
+
+    """
+    def __init__(self, hidden_size, attention_head_size, dropout, bias=True):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.attention_head_size = attention_head_size
+        # Create the query, key, and value projection layers
+        self.query = nn.Linear(hidden_size, attention_head_size, bias=bias)
+        self.key = nn.Linear(hidden_size, attention_head_size, bias=bias)
+        self.value = nn.Linear(hidden_size, attention_head_size, bias=bias)
+
+        self.dropout = nn.Dropout(dropout)
+    
+    def forward(self, x):
+        # Project the input into query, key, and value
+        # The same input is used to generate the query, key, and value,
+        # so it's usually called self-attention.
+        # (batch_size, sequence_length, hidden_size) -> (batch_size, sequence_length, attention_head_size)
+        query = self.query(x)
+        key = self.key(x)
+        value = self.value(x)
+        # Calculate the attention scores
+        # softmax(Q*K.T/sqrt(head_size))*V
+        attention_scores = torch.matmul(query, key.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs = self.dropout(attention_probs)
+        # Calculate the attention output
+        attention_output = torch.matmul(attention_probs, value)
+        return (attention_output, attention_probs)
+
+
+class MultiHeadAttention(nn.Module):
+    """
+    Multi-head attention module.
+    This module is used in the TransformerEncoder module.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config["hidden_size"]
+        self.num_attention_heads = config["num_attention_heads"]
+        # The attention head size is the hidden size divided by the number of attention heads
+        self.attention_head_size = self.hidden_size // self.num_attention_heads
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        # Whether or not to use bias in the query, key, and value projection layers
+        self.qkv_bias = config["qkv_bias"]
+        # Create a list of attention heads
+        self.heads = nn.ModuleList([])
+        for _ in range(self.num_attention_heads):
+            head = AttentionHead(
+                self.hidden_size,
+                self.attention_head_size,
+                config["attention_probs_dropout_prob"],
+                self.qkv_bias
+            )
+            self.heads.append(head)
+        # Create a linear layer to project the attention output back to the hidden size
+        # In most cases, all_head_size and hidden_size are the same
+        self.output_projection = nn.Linear(self.all_head_size, self.hidden_size)
+        self.output_dropout = nn.Dropout(config["hidden_dropout_prob"])
+
+    def forward(self, x, output_attentions=False):
+        # Calculate the attention output for each attention head
+        attention_outputs = [head(x) for head in self.heads]
+        # Concatenate the attention outputs from each attention head
+        attention_output = torch.cat([attention_output for attention_output, _ in attention_outputs], dim=-1)
+        # Project the concatenated attention output back to the hidden size
+        attention_output = self.output_projection(attention_output)
+        attention_output = self.output_dropout(attention_output)
+        # Return the attention output and the attention probabilities (optional)
+        if not output_attentions:
+            return (attention_output, None)
+        else:
+            attention_probs = torch.stack([attention_probs for _, attention_probs in attention_outputs], dim=1)
+            return (attention_output, attention_probs)
+
+
+class FasterMultiHeadAttention(nn.Module):
+    """
+    Multi-head attention module with some optimizations.
+    All the heads are processed simultaneously with merged query, key, and value projections.
+    """
+
+    def __init__(self, config):
+        super().__init__()
+        self.hidden_size = config["hidden_size"]
+        self.num_attention_heads = config["num_attention_heads"]
+        # The attention head size is the hidden size divided by the number of attention heads
+        self.attention_head_size = self.hidden_size // self.num_attention_heads
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+        # Whether or not to use bias in the query, key, and value projection layers
+        self.qkv_bias = config["qkv_bias"]
+        # Create a linear layer to project the query, key, and value
+        self.qkv_projection = nn.Linear(self.hidden_size, self.all_head_size * 3, bias=self.qkv_bias)
+        self.attn_dropout = nn.Dropout(config["attention_probs_dropout_prob"])
+        # Create a linear layer to project the attention output back to the hidden size
+        # In most cases, all_head_size and hidden_size are the same
+        self.output_projection = nn.Linear(self.all_head_size, self.hidden_size)
+        self.output_dropout = nn.Dropout(config["hidden_dropout_prob"])
+
+    def forward(self, x, output_attentions=False):
+        # Project the query, key, and value
+        # (batch_size, sequence_length, hidden_size) -> (batch_size, sequence_length, all_head_size * 3)
+        qkv = self.qkv_projection(x)
+        # Split the projected query, key, and value into query, key, and value
+        # (batch_size, sequence_length, all_head_size * 3) -> (batch_size, sequence_length, all_head_size)
+        query, key, value = torch.chunk(qkv, 3, dim=-1)
+        # Resize the query, key, and value to (batch_size, num_attention_heads, sequence_length, attention_head_size)
+        batch_size, sequence_length, _ = query.size()
+        query = query.view(batch_size, sequence_length, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        key = key.view(batch_size, sequence_length, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        value = value.view(batch_size, sequence_length, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
+        # Calculate the attention scores
+        # softmax(Q*K.T/sqrt(head_size))*V
+        attention_scores = torch.matmul(query, key.transpose(-1, -2))
+        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
+        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
+        attention_probs = self.attn_dropout(attention_probs)
+        # Calculate the attention output
+        attention_output = torch.matmul(attention_probs, value)
+        # Resize the attention output
+        # from (batch_size, num_attention_heads, sequence_length, attention_head_size)
+        # To (batch_size, sequence_length, all_head_size)
+        attention_output = attention_output.transpose(1, 2) \
+                                           .contiguous() \
+                                           .view(batch_size, sequence_length, self.all_head_size)
+        # Project the attention output back to the hidden size
+        attention_output = self.output_projection(attention_output)
+        attention_output = self.output_dropout(attention_output)
+        # Return the attention output and the attention probabilities (optional)
+        if not output_attentions:
+            return (attention_output, None)
+        else:
+            return (attention_output, attention_probs)
+
+
+class MLP_Vit(nn.Module):
+    """
+    A multi-layer perceptron module.
+    """
+
+    def __init__(self, config, params):
+        super().__init__()
+        self.params = params.copy()
+        self.dense_1 = nn.Linear(config["hidden_size"], config["intermediate_size"])
+        self.activation = NewGELUActivation()
+        self.dense_2 = nn.Linear(config["intermediate_size"], config["hidden_size"])
+        self.dropout = nn.Dropout(config["hidden_dropout_prob"])
+        self.ln = nn.LayerNorm(config["intermediate_size"])
+
+    def forward(self, x):
+        x = self.dense_1(x)
+        if self.params['norm_config']=='ln_before':
+            x = self.ln(x)
+        x = self.activation(x)
+        if self.params['norm_config']=='ln_after':
+            x = self.ln(x)
+        x = self.dense_2(x)
+        x = self.dropout(x)
+        return x
+
+
+class Block(nn.Module):
+    """
+    A single transformer block.
+    """
+
+    def __init__(self, config, params):
+        super().__init__()
+        self.params = params.copy()
+        self.use_faster_attention = config.get("use_faster_attention", False)
+        if self.use_faster_attention:
+            self.attention = FasterMultiHeadAttention(config)
+        else:
+            self.attention = MultiHeadAttention(config)
+        self.layernorm_1 = nn.LayerNorm(config["hidden_size"])
+        self.mlp = MLP_Vit(config, self.params)
+        self.layernorm_2 = nn.LayerNorm(config["hidden_size"])
+
+    def forward(self, x, output_attentions=False):
+        # Self-attention
+        attention_output, attention_probs = \
+            self.attention(self.layernorm_1(x), output_attentions=output_attentions)
+        # Skip connection
+        x = x + attention_output
+        # Feed-forward network
+        mlp_output = self.mlp(self.layernorm_2(x))
+        # Skip connection
+        x = x + mlp_output
+        # Return the transformer block's output and the attention probabilities (optional)
+        if not output_attentions:
+            return (x, None)
+        else:
+            return (x, attention_probs)
+
+
+class Encoder(nn.Module):
+    """
+    The transformer encoder module.
+    """
+
+    def __init__(self, config, params):
+        super().__init__()
+        # Create a list of transformer blocks
+        self.blocks = nn.ModuleList([])
+        self.params = params.copy()
+        for _ in range(config["num_hidden_layers"]):
+            block = Block(config, self.params)
+            self.blocks.append(block)
+
+    def forward(self, x, output_attentions=False):
+        # Calculate the transformer block's output for each block
+        all_attentions = []
+        for block in self.blocks:
+            x, attention_probs = block(x, output_attentions=output_attentions)
+            if output_attentions:
+                all_attentions.append(attention_probs)
+        # Return the encoder's output and the attention probabilities (optional)
+        if not output_attentions:
+            return (x, None)
+        else:
+            return (x, all_attentions)
+
+
+class ViTForClassfication(ImageClassificationBase):
+    """
+    The ViT model for classification.
+    """
+
+    def __init__(self, config, params):
+        self.params = params.copy()
+        
+        """        
+        super(VGG, self).__init__()
+        super(VGG, self).__init__(self, params['n_out'], params['NSteps'], params['n_epochs'])
+        """
+        nn.Module.__init__(self)
+        
+        #super().__init__()
+        self.config = config
+        self.image_size = config["image_size"]
+        self.hidden_size = config["hidden_size"]
+        self.num_classes = config["num_classes"]
+        # Create the embedding module
+        self.embedding = Embeddings(config)
+        # Create the transformer encoder module
+        self.encoder = Encoder(config, self.params)
+        # Create a linear layer to project the encoder's output to the number of classes
+        
+        self.prev_size=self.hidden_size
+        self.n_outputs=self.num_classes
+        
+        self.output = nn.Linear(self.prev_size, self.n_outputs)
+        # Initialize the weights
+        self.apply(self.initialize_weights)
+
+    def forward(self, x, output_attentions=False):
+        outs = {}
+        
+
+        
+        # Calculate the embedding output
+        embedding_output = self.embedding(x)
+        # Calculate the encoder's output
+        encoder_output, all_attentions = self.encoder(embedding_output, output_attentions=output_attentions)
+        # Calculate the logits, take the [CLS] token's output as features for classification
+        logits = self.output(encoder_output[:, 0, :])
+        # Return the logits and the attention probabilities (optional)
+                
+        """
+        if not output_attentions:
+            return (logits, None)
+        else:
+            return (logits, all_attentions)
+    
+        """
+        outs['l2'] = encoder_output[:, 0, :]
+
+        outs['out'] = logits
+        #outs['pred'] = torch.argmax(logits, dim=1)
+        #return outs
+        return outs['out']
+        
+        
+    
+    
+    
+    def initialize_weights(self, module):
+        if isinstance(module, (nn.Linear, nn.Conv2d)):
+            #torch.nn.init.normal_(module.weight, mean=0.0, std=self.config["initializer_range"])
+            nn.init.kaiming_normal_(module.weight) #using the same init compatible with our analisys
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        elif isinstance(module, Embeddings):
+            module.position_embeddings.data = nn.init.trunc_normal_(
+                module.position_embeddings.data.to(torch.float32),
+                mean=0.0,
+                std=self.config["initializer_range"],
+            ).to(module.position_embeddings.dtype)
+
+            module.cls_token.data = nn.init.trunc_normal_(
+                module.cls_token.data.to(torch.float32),
+                mean=0.0,
+                std=self.config["initializer_range"],
+            ).to(module.cls_token.dtype)
+
+#%%define instance of the model
+
+            
+
+
+#ResNet101 from https://github.com/mbk2103/ResNet101-Implementation/blob/main/resnet_model.py
+# Define Residual Block
+class ResidualBlock(nn.Module):
+    def __init__(self,params, in_channels, out_channels, stride=1):
+        super(ResidualBlock, self).__init__()
+        self.params = params.copy()
+
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(out_channels)
+
+        # Shortcut connection to handle different input/output dimensions
+        self.shortcut = nn.Sequential()
+        
+        if stride != 1 or in_channels != out_channels:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_channels)
+            )
+
+    def forward(self, x):
+        residual = x
+        
+        out = self.conv1(x)
+        if self.params['norm_config'] == 'bn_before':
+            out = self.bn1(out)
+        out = self.relu(out)
+        if self.params['norm_config'] == 'bn_after':
+            out = self.bn1(out)
+
+        out = self.conv2(out)
+        if self.params['norm_config'] == 'bn_before':
+            out = self.bn2(out)
+
+        out += self.shortcut(residual)
+        out = self.relu(out)
+        if self.params['norm_config'] == 'bn_after':
+            out = self.bn2(out)
+
+        return out
+  
+# Define ResNet101v2 model
+class ResNet101v2(nn.Module):
+    def __init__(self, params, num_classes=1000 ):
+        super(ResNet101v2, self).__init__()
+        self.params = params.copy()
+        self.conv1 = nn.Conv2d(3, 64, kernel_size=7, stride=2, padding=3, bias = False)
+        self.bn1 = nn.BatchNorm2d(64)
+        self.relu = nn.ReLU(inplace = True)
+        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+
+        self.layer1 = self._make_layer(64, 64, blocks=3, stride=1)
+        self.layer2 = self._make_layer(64, 128, blocks=4, stride=2)
+        self.layer3 = self._make_layer(128, 256, blocks=23, stride=2)
+        self.layer4 = self._make_layer(256, 512, blocks=3, stride=2)
+
+        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
+        self.fc = nn.Linear(512, num_classes)
+
+    def _make_layer(self, in_channels, out_channels, blocks, stride):
+        layers = [ResidualBlock(self.params, in_channels, out_channels, stride)]
+        for _ in range(1, blocks):
+            layers.append(ResidualBlock(self.params, out_channels, out_channels, stride=1))
+        return nn.Sequential(*layers)
+
+    def forward(self, x):
+        x = self.conv1(x)
+        if self.params['norm_config'] == 'bn_before':
+            x = self.bn1(x)
+        x = self.relu(x)
+        x = self.maxpool(x)
+        if self.params['norm_config'] == 'bn_after':
+            x = self.bn1(x)
+
+        x = self.layer1(x)
+        x = self.layer2(x)
+        x = self.layer3(x)
+        x = self.layer4(x)
+
+        x = self.avgpool(x)
+        x = x.view(x.size(0), -1)
+        x = self.fc(x)
+
+        return x
+
+
+
+
+
+
+
+
+
+
 #############################################
 # 6. Single simulation run (training + evaluation)
 #############################################
@@ -869,13 +1677,19 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     num_hidden_layers = param_config["num_hidden_layers"]
     hidden_dim = 100
 
+    train_classes = per_class_counting(train_dataset)
+
+    num_classes = len(train_classes)
+
+
+
     if dataset_name == "gaussian":
         output_dim = 2
     elif param_config.get("class_mapping", None) is not None:
         # Use the number of unique new labels
         output_dim = len(set(param_config["class_mapping"].values()))
     else:
-        output_dim = 10  # default for full MNIST or CIFAR10
+        output_dim = num_classes  # default for full MNIST or CIFAR10
 
     # --- Wandb initialization ---
     norm_config = param_config.get("norm_config")
@@ -961,11 +1775,39 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
             drop_path_rate=0.2,
             norm_config=norm_config
         )
+
+
+    elif param_config['model'] == 'ViT':
+
+        # Auto-get image size/channels for config
+        sample_img, _ = train_dataset[0]
+        input_channels = sample_img.shape[0]
+        input_image_size = sample_img.shape[1]  # assumes square; use shape[1], shape[2] if not
+
+
+        config = {
+    "patch_size": 4,
+    "hidden_size": 48,
+    "num_hidden_layers": 4,
+    "num_attention_heads": 4,
+    "intermediate_size": 4 * 48,
+    "hidden_dropout_prob": 0.0,
+    "attention_probs_dropout_prob": 0.0,
+    "initializer_range": 0.02,
+    "image_size": input_image_size,    # <-- Automatically set!
+    "num_classes": num_classes,
+    "num_channels": input_channels,    # <-- Automatically set!
+    "qkv_bias": False,
+}
+        model = ViTForClassfication(config, param_config)
+
+
+    elif param_config['model'] == 'ResNet101':
+        model = ResNet101v2(param_config, num_classes=output_dim)
     else:
         raise ValueError(f"Unknown model {model_name}")
 
     model.to(device)
-    
     # --- Filtering mode (if used) ---
     # Define threshold values as before.
     threshold_map = {
@@ -985,7 +1827,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                 print(f"[Filtering mode High IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
                 wandb.finish()
                 return
-            diff, frac0, frac1 = filtering_check(model, train_X, device)
+            diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
             if diff > threshold:
                 print(f"[Filtering mode High IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
@@ -999,7 +1841,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
                 print(f"[Filtering mode Low IGB] Maximum attempts reached ({max_attempts}). Exiting simulation.")
                 wandb.finish()
                 return
-            diff, frac0, frac1 = filtering_check(model, train_X, device)
+            diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
             if diff < threshold:
                 print(f"[Filtering mode Low IGB] Condition met after {counter} iterations: diff = {diff:.4f}")
                 break
@@ -1011,7 +1853,7 @@ def run_simulation(sim_log_dir, device, sample_index, param_config):
     # --- Ordering Output Nodes ---
     OrderingClassesFlag = 'ON'
     if OrderingClassesFlag == 'ON':
-        diff, frac0, frac1 = filtering_check(model, train_X, device)
+        diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
         print(f"Initial fractions: class0 = {frac0:.4f}, class1 = {frac1:.4f}")
         # For binary classification, simply rank the two classes:
         if frac0 >= frac1:
@@ -1146,17 +1988,25 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
     # --- Model parameters ---
     hidden_dim = 100
 
+    train_classes = per_class_counting(train_dataset)
+
+    num_classes = len(train_classes)
+
+
     if dataset_name == "gaussian":
         output_dim = 2
     elif param_config.get("class_mapping", None) is not None:
         # Use the number of unique new labels
         output_dim = len(set(param_config["class_mapping"].values()))
     else:
-        output_dim = 10  # default for full MNIST or CIFAR10
+        output_dim = num_classes  # default for full MNIST or CIFAR10
 
 
     # Define file path for storing the frac0 values for this configuration
     log_file_path = os.path.join(combo_log_dir, 'init_frac0.txt')
+    # Define file paths for the new logs
+    log_file_maxf = os.path.join(combo_log_dir, 'init_max_f.txt')
+    log_file_vector = os.path.join(combo_log_dir, 'init_frac_vector.txt')
     
     # For each independent initialization:
     for experiment in range(1, n_experiments + 1):
@@ -1179,18 +2029,46 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
                 raise ValueError("For Swin models, use norm_config 'ln_before' or 'ln_after'.")
             ctor = {'Swin_T': Swin_T, 'Swin_S': Swin_S, 'Swin_B': Swin_B, 'Swin_L': Swin_L}[model_name]
             model = ctor(num_classes=output_dim, input_resolution=input_resolution, drop_path_rate=0.2, norm_config=norm_config)
+
+
+
+        elif param_config['model'] == 'ViT':
+
+            # Auto-get image size/channels for config
+            sample_img, _ = train_dataset[0]
+            input_channels = sample_img.shape[0]
+            input_image_size = sample_img.shape[1]  # assumes square; use shape[1], shape[2] if not
+
+            config = {
+        "patch_size": 4,
+        "hidden_size": 48,
+        "num_hidden_layers": 4,
+        "num_attention_heads": 4,
+        "intermediate_size": 4 * 48,
+        "hidden_dropout_prob": 0.0,
+        "attention_probs_dropout_prob": 0.0,
+        "initializer_range": 0.02,
+        "image_size": input_image_size,    # <-- Automatically set!
+        "num_classes": num_classes,
+        "num_channels": input_channels,    # <-- Automatically set!
+        "qkv_bias": False,
+    }
+            model = ViTForClassfication(config, param_config)
+
+
+        elif param_config['model'] == 'ResNet101':
+            model = ResNet101v2(param_config, num_classes=output_dim)
         else:
             raise ValueError(f"Unknown model {model_name}")
         model.to(device)
         
         # Compute initial fractions without any reinitialization loop
-        diff, frac0, frac1 = filtering_check(model, train_X, device)
+        diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
         #print(f"Experiment {experiment} for config {param_config}: Initial frac0 = {frac0:.4f}, frac1 = {frac1:.4f}")
-        
         # Optionally perform ordering if desired
-        OrderingClassesFlag = 'ON'  # Alternatively, this flag could be set via param_config
+        OrderingClassesFlag = 'OFF'  # Alternatively, this flag could be set via param_config
         if OrderingClassesFlag == 'ON':
-            diff, frac0, frac1 = filtering_check(model, train_X, device)
+            diff, frac0, frac1, class_fractions, max_fraction = filtering_check(model, train_X, device)
             #print(f"Initial fractions: class0 = {frac0:.4f}, class1 = {frac1:.4f}")
             # For binary classification, simply rank the two classes:
             if frac0 >= frac1:
@@ -1207,6 +2085,15 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
             with open(log_file_path, 'a') as f:
                 f.write(f"{frac0}\n")
 
+            # Append the max fraction to its log file
+            with open(log_file_maxf, 'a') as f:
+                f.write(f"{max_fraction}\n")
+
+            # Append the full vector of class fractions (space-separated) to its log file
+            with open(log_file_vector, 'a') as f:
+                f.write(" ".join([f"{frac:.8f}" for frac in class_fractions]) + "\n")
+
+
 
 #############################################
 # 7. Main: Outer loop over simulation experiments with a parameter grid
@@ -1214,6 +2101,8 @@ def run_init_statistics(combo_log_dir, device, param_config, n_experiments=3000)
 def main():
     device_str = 'cuda:1'  #'cuda:0'  # or 'cpu'
     device = torch.device(device_str if torch.cuda.is_available() else 'cpu')
+
+    ModelFlag = 'ResNet101'  #'MLP'  # or 'ViT'  # or 'ResNet101'
     
     # Set the RunMode flag:
     RunMode = 'InitStatistics'  #'Dynamics'  # or 'InitStatistics'
@@ -1222,22 +2111,23 @@ def main():
     # To add/change parameters, simply modify this dictionary.
 
     param_grid = {
-    'dataset': ['CIFAR10'], # 'Gaussian', 'MNIST', 'CIFAR10'
+    'dataset': ['tinyimagenet'], # 'Gaussian', 'MNIST', 'CIFAR10'
     'offset_value': [0.0],
     'learning_rate': [0.00001],
     'batch_size': [512],
-    'num_hidden_layers': [1, 20],
-    'norm_config': ['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #['bn_before'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
+    'num_hidden_layers': [1],#[1, 20],
+    'norm_config': ['bn_before','bn_after'], #['bn_before','bn_after'], #['none', 'ln_before','ln_after'], #['bn_before'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], #['ln_after'], #['none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'], # 'none', 'bn_before', 'ln_before', 'bn_after', 'ln_after'
     'filtering_mode': ['none'],  # 'high_igb', 'low_igb', or 'none'
-    'class_mapping': [{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}], #[{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
+    'class_mapping': [None], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}], #[{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}], #[{0:0, 1:0, 3:1, 4:1, 5:1, 7:1, 8:0, 9:0}]#[{3:0, 5:1}]#[{3:0, 5:1}]# [{0:0, 1:1, 2:0, 3:1, 4:0, 5:1, 6:0, 7:1, 8:0, 9:1}] #if you set "class_mapping": None the dataset is not filtered. Otherwise, the mapping dictionary is used for filtering/aggregation.
     'n_per_class': ['min'],  # Number of samples per class to select (None for all); can be a None dict or int or 'min'
+    'model': [ModelFlag],  # 'MLP', 'ViT', or 'ResNet101'
 }
     
     # Use itertools.product to generate all parameter combinations.
     keys = list(param_grid.keys())
     combinations = list(itertools.product(*(param_grid[key] for key in keys)))
 
-    n_experiments = 5000 #10#5000  # number of independent runs (samples)
+    n_experiments = 10000 #10#5000  # number of independent runs (samples)
 
     if RunMode == 'Dynamics':
         base_log_dir = './logs'
@@ -1288,3 +2178,36 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

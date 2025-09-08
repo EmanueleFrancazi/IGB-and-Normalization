@@ -1407,10 +1407,15 @@ class MLP_Vit(nn.Module):
         self.activation = NewGELUActivation()
         self.dense_2 = nn.Linear(config["intermediate_size"], config["hidden_size"])
         self.dropout = nn.Dropout(config["hidden_dropout_prob"])
+        self.ln = nn.LayerNorm(config["intermediate_size"])
 
     def forward(self, x):
         x = self.dense_1(x)
+        if params['NormPos']=='Before':
+            x = self.ln(x)
         x = self.activation(x)
+        if params['NormPos']=='After':
+            x = self.ln(x)
         x = self.dense_2(x)
         x = self.dropout(x)
         return x
