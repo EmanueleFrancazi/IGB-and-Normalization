@@ -63,11 +63,30 @@ def get_loader(args):
                                    transform=transform_test) if args.local_rank in [-1, 0] else None
 
     elif args.dataset == "CatsVsDogs":
-        
+
         #data_dir='/home/EAWAG/francaem/restored/data/Cifar10_Kaggle_link/Cats_Dogs'
         data_dir="/cluster/home/efrancazi/Data/Cat_vs_Dog/cifar10"
         trainset = ImageFolder(data_dir+'/train', train_tfms)
         testset = ImageFolder(data_dir+'/test', valid_tfms)
+
+    elif args.dataset == "tiny_imagenet":
+        from datasets import load_dataset
+        hf_train = load_dataset("zh-plus/tiny-imagenet", split="train")
+        hf_val = load_dataset("zh-plus/tiny-imagenet", split="val") if args.local_rank in [-1, 0] else None
+        def wrap(ds, transform):
+            class HFWrapper(torch.utils.data.Dataset):
+                def __init__(self, ds):
+                    self.ds = ds
+                def __len__(self):
+                    return len(self.ds)
+                def __getitem__(self, idx):
+                    item = self.ds[idx]
+                    img = transform(item['image'])
+                    label = item['label']
+                    return img, label
+            return HFWrapper(ds)
+        trainset = wrap(hf_train, transform_train)
+        testset = wrap(hf_val, transform_test) if hf_val is not None else None
 
     else:
         trainset = datasets.CIFAR100(root="./data",
