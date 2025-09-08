@@ -150,7 +150,8 @@ def transforms_imagenet_eval(
         interpolation='bilinear',
         use_prefetcher=False,
         mean=IMAGENET_DEFAULT_MEAN,
-        std=IMAGENET_DEFAULT_STD):
+        std=IMAGENET_DEFAULT_STD,
+        add_constant=0.0):
     crop_pct = crop_pct or DEFAULT_CROP_PCT
 
     if isinstance(img_size, (tuple, list)):
@@ -171,8 +172,10 @@ def transforms_imagenet_eval(
         # prefetcher and collate will handle tensor conversion and norm
         tfl += [ToNumpy()]
     else:
+        tfl += [transforms.ToTensor()]
+        if add_constant != 0.0:
+            tfl += [AddConstant(add_constant)]
         tfl += [
-            transforms.ToTensor(),
             transforms.Normalize(
                      mean=torch.tensor(mean),
                      std=torch.tensor(std))
@@ -254,6 +257,7 @@ def create_transform(
                 use_prefetcher=use_prefetcher,
                 mean=mean,
                 std=std,
-                crop_pct=crop_pct)
+                crop_pct=crop_pct,
+                add_constant=add_constant)
 
     return transform

@@ -211,6 +211,8 @@ def build_transform(is_train, config):
             )
 
     t.append(transforms.ToTensor())
+    if config.DATA.ADD_CONSTANT != 0.0:
+        t.append(AddConstant(config.DATA.ADD_CONSTANT))
     t.append(transforms.Normalize(mean, std))
     transform = transforms.Compose(t)
     return transform

@@ -9,4 +9,5 @@ from .mixup import Mixup, FastCollateMixup
 from .parsers import create_parser
 from .real_labels import RealLabelsImagenet
 from .transforms import *
+from .transforms import AddConstant
 from .transforms_factory import create_transform
