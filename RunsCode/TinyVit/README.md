@@ -80,6 +80,12 @@ We finetune the 1k models on IN-1k to higher resolution progressively (224 -> 38
 - [How to save teacher sparse logits?](./docs/SAVE_TEACHER_LOGITS.md)
 - [Let's train a TinyViT model](./docs/TRAINING.md)
 
+### Data offset
+
+The configuration option `DATA.ADD_CONSTANT` allows adding a constant value to
+every image before normalization. Set it to a non-zero value to shift all pixel
+values by the specified amount.
+
 ## Citation
 
 If this repo is helpful for you, please consider to cite it. :mega: Thank you! :)
