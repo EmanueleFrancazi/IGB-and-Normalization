@@ -37,6 +37,9 @@ This folder contains all the codes used to perform experiments. It includes subf
 - **`ViT/`**
   - This subfolder contains an adaptation of the [ViT-pytorch repository](https://github.com/jeonsworld/ViT-pytorch), which is a PyTorch reimplementation of Google's [Vision Transformer (ViT) repository](https://github.com/google-research/vision_transformer). This serves as an example of how the code for a specific project can be re-adapted to investigate IGB.
 
+- **`MLP_Experiments/`**
+  - Provides the unified training script `MLP_Runs.py`, enabling experiments with MLP, ViT, ResNet101, and Swin Transformer variants while controlling normalization placement.
+
 **Note:** This version of the repository does not use the `apex` package. If you wish to integrate `apex` for mixed-precision training or distributed training, follow these steps:
 
 1. Search for code blocks marked with `#avoid apex`.
